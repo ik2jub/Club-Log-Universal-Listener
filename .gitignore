@@ -1,0 +1,18 @@
+# Impostazioni e credenziali locali (cifrate, ma comunque personali)
+clublog_listener.json
+
+# Coda dei QSO e file generati in esecuzione
+clublog_listener_coda.json
+clublog_listener_coda.json.*
+*.adi
+*.adif
+caricamenti_in_attesa/
+caricamenti_inviati/
+
+# Python
+__pycache__/
+*.pyc
+
+# Mai pubblicare password o chiavi
+*pwd*.txt
+*password*

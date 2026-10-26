@@ -1,0 +1,3 @@
+# Facoltativi: servono solo per l'icona nella tray bar
+pystray>=0.19
+pillow>=10.1
