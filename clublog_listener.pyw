@@ -68,6 +68,9 @@ DEFAULT_INTERVAL_S = 5        # pausa minima tra due QSO inviati con realtime.ph
 DEFAULT_BATCH_THRESHOLD = 20  # da quanti QSO in coda si passa all'invio a blocchi (0 = mai)
 BATCH_MIN_INTERVAL_S = 300    # pausa minima tra due invii a blocchi
 BATCH_MAX_QSO = 5000
+# Errori temporanei del server per cui realtime.php viene ritentato più tardi;
+# per ogni altro codice diverso da 200 gli invii si fermano
+RETRYABLE_HTTP = (500, 502, 503, 504)
 
 
 # --------------------------------------------------------------------------
@@ -880,8 +883,10 @@ class Uploader(threading.Thread):
                 pass
             self._drop_first()
             self.next_try = time.time() + self.interval
-        else:  # 500 (manutenzione) e simili: Club Log dice di riprovare più tardi
+        elif code in RETRYABLE_HTTP:  # 500 (manutenzione) e simili: Club Log dice di riprovare più tardi
             self._retry_later(item, "Club Log ha risposto HTTP %d (%s)" % (code, short))
+        else:  # qualsiasi altro codice: Club Log chiede di fermarsi
+            self._pause("Club Log ha risposto HTTP %d (%s)" % (code, short))
 
 
 # --------------------------------------------------------------------------
