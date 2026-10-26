@@ -13,6 +13,13 @@ caricamenti_inviati/
 __pycache__/
 *.pyc
 
+# API key integrata ed eseguibile che la contiene: solo per il gruppo, mai su GitHub
+chiave_api.py
+build/
+dist/
+*.spec
+*.exe
+
 # Mai pubblicare password o chiavi
 *pwd*.txt
 *password*

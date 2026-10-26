@@ -63,6 +63,19 @@ includono già nel codice; questo programma è open source, quindi **ognuno deve
 inserirla nella GUI. Non pubblicare mai la tua API key: Club Log cancella automaticamente le chiavi che
 trova pubblicate online.
 
+### Versione con API key integrata (per il proprio gruppo)
+
+Per dare agli operatori di una spedizione un programma pronto all'uso, senza Python e senza il campo
+API key:
+
+1. esegui `crea_exe.bat`: la prima volta chiede la API key (tramite `imposta_chiave_api.py`, che crea
+   `chiave_api.py` con la chiave offuscata);
+2. distribuisci `dist\ClubLogUniversalListener.exe` **solo all'interno del gruppo**.
+
+`chiave_api.py`, `build\` e `dist\` sono esclusi da git. L'offuscamento impedisce solo la lettura a colpo
+d'occhio: chi ha l'eseguibile può estrarre la chiave, quindi **non pubblicare l'eseguibile** (né come
+release né altrove).
+
 ## Configurazione dei programmi
 
 Porte proposte di default (modificabili dalla GUI). Ogni programma deve inviare a una porta diversa.
@@ -87,7 +100,7 @@ Note:
 
 | File | Contenuto |
 |---|---|
-| `clublog_listener.json` | Impostazioni (password e API key cifrate) |
+| `clublog_listener.json` | Impostazioni (password e API key cifrate; la chiave integrata non viene mai salvata qui) |
 | `clublog_listener_coda.json` | QSO in attesa di invio |
 | `qso_ricevuti.adi` | Copia ADIF di tutti i QSO ricevuti |
 | `qso_rifiutati.adi` | QSO scartati da Club Log come non validi |

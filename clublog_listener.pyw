@@ -124,6 +124,39 @@ def unprotect_secret(value):
 
 
 # --------------------------------------------------------------------------
+# API key integrata (facoltativa)
+# --------------------------------------------------------------------------
+# Il codice pubblico non contiene nessuna chiave. Chi vuole una versione con la
+# chiave integrata esegue imposta_chiave_api.py, che crea chiave_api.py (escluso
+# da git) e poi crea_exe.bat. L'offuscamento evita solo la lettura a colpo
+# d'occhio: non è una protezione crittografica, perciò l'eseguibile va
+# distribuito solo all'interno del gruppo.
+
+_KEY_SALT = b"ClubLogUniversalListener"
+
+
+def obfuscate_key(key):
+    data = bytes(b ^ _KEY_SALT[i % len(_KEY_SALT)] ^ (i * 7 & 0xFF) for i, b in enumerate(key.encode("utf-8")))
+    return base64.b64encode(data).decode("ascii")[::-1]
+
+
+def reveal_key(value):
+    data = base64.b64decode(value[::-1])
+    return bytes(b ^ _KEY_SALT[i % len(_KEY_SALT)] ^ (i * 7 & 0xFF) for i, b in enumerate(data)).decode("utf-8")
+
+
+def load_builtin_api_key():
+    try:
+        import chiave_api
+        return reveal_key(chiave_api.CHIAVE).strip()
+    except Exception:
+        return ""
+
+
+BUILTIN_API_KEY = load_builtin_api_key()
+
+
+# --------------------------------------------------------------------------
 # ADIF
 # --------------------------------------------------------------------------
 
@@ -1036,13 +1069,17 @@ def run_gui():
     e_pwd = ttk.Entry(cred, textvariable=v_pwd, width=32, show="•")
     e_pwd.grid(row=1, column=1, sticky="w", padx=(4, 16), pady=(6, 0))
     ttk.Label(cred, text="API key:").grid(row=1, column=2, sticky="e", pady=(6, 0))
-    e_api = ttk.Entry(cred, textvariable=v_api, width=44, show="•")
+    if BUILTIN_API_KEY:
+        e_api = ttk.Label(cred, text="integrata nel programma", foreground=COLORS["ok"])
+    else:
+        e_api = ttk.Entry(cred, textvariable=v_api, width=44, show="•")
     e_api.grid(row=1, column=3, sticky="w", padx=(4, 16), pady=(6, 0))
 
     def toggle_show():
         ch = "" if v_show.get() else "•"
         e_pwd.configure(show=ch)
-        e_api.configure(show=ch)
+        if not BUILTIN_API_KEY:
+            e_api.configure(show=ch)
 
     opts = ttk.Frame(cred)
     opts.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
@@ -1152,7 +1189,7 @@ def run_gui():
         if not c["dry_run"]:
             for key, label in (("email", "l'email Club Log"), ("password", "l'app password"),
                                ("api", "l'API key")):
-                if not c[key]:
+                if not c[key] and not (key == "api" and BUILTIN_API_KEY):
                     errs.append("Inserisci %s (o attiva la modalità TEST)." % label)
         try:
             c["interval"] = int(c["interval"])
@@ -1237,6 +1274,8 @@ def run_gui():
             add_log("warn", "Avvio in modalità TEST: i QSO vengono ricevuti ma NON inviati a Club Log.")
         else:
             add_log("info", "Avvio: i QSO verranno caricati nel log Club Log di %s." % c["callsign"])
+        if BUILTIN_API_KEY:
+            c = dict(c, api=BUILTIN_API_KEY)  # mai salvata nelle impostazioni
         engine.start(c, active)
         set_running(True)
 
