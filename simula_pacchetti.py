@@ -35,10 +35,10 @@ def utf8(s):
     return struct.pack(">I", len(b)) + b
 
 
-def qdatetime(t):
+def qdatetime(t, spec=1):
     jd = t.date().toordinal() + 1721425
     ms = ((t.hour * 60 + t.minute) * 60 + t.second) * 1000
-    return struct.pack(">qIB", jd, ms, 1)  # 1 = UTC
+    return struct.pack(">qIB", jd, ms, spec)  # 1 = UTC, 0 = ora locale
 
 
 def header(mtype, client_id):
@@ -50,9 +50,11 @@ def wsjtx_heartbeat(client_id):
 
 
 def wsjtx_qso_logged(client_id, mycall, call, hz, mode, t_on, t_off):
-    return (header(5, client_id) + qdatetime(t_off) + utf8(call) + utf8("FN42") +
+    # JTDX manda le cifre dell'ora UTC marcate come ora locale
+    spec = 0 if client_id == "JTDX" else 1
+    return (header(5, client_id) + qdatetime(t_off, spec) + utf8(call) + utf8("FN42") +
             struct.pack(">Q", hz) + utf8(mode) + utf8("-10") + utf8("-12") + utf8("100") +
-            utf8("") + utf8("") + qdatetime(t_on) + utf8("") + utf8(mycall) + utf8("JN45") +
+            utf8("") + utf8("") + qdatetime(t_on, spec) + utf8("") + utf8(mycall) + utf8("JN45") +
             utf8("") + utf8("") + utf8(""))
 
 

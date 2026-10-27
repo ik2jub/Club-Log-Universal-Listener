@@ -10,6 +10,8 @@ batch catch-up uploads (putlogs.php), ADIF import filtered by station callsign, 
 
 ## Funzioni
 
+- **Finestra compatta a schede**: "Club Log" (credenziali e opzioni) e "UDP" (porte in ascolto), con
+  i pulsanti e l'area messaggi sempre visibili sotto. Le impostazioni si salvano da sole a ogni modifica.
 - **5 porte UDP**, una per programma. Per ognuna si sceglie l'interfaccia di rete (`0.0.0.0` = tutte,
   `127.0.0.1` o l'IP di una scheda), la porta e, se serve, un gruppo multicast (es. `224.0.0.1`).
 - **Riconoscimento automatico del formato** su ogni porta:
@@ -23,6 +25,23 @@ batch catch-up uploads (putlogs.php), ADIF import filtered by station callsign, 
 - **Rispetto delle regole di Club Log**: pausa minima configurabile tra due invii, invio a blocchi con
   `putlogs.php` quando la coda cresce (es. dopo un'interruzione della linea), almeno 5 minuti tra due invii
   a blocchi, stop immediato in caso di credenziali rifiutate (HTTP 403).
+- **Recupero dei QSO registrati a listener spento** (WSJT-X, JTDX, MSHV): mentre ascolta, il
+  programma salva ogni minuto l'ultimo momento in ascolto per ogni programma. Al riavvio dell'ascolto
+  (dopo la chiusura, "Ferma", lo spegnimento di Windows, un crash o una mancanza di corrente) legge il log
+  del programma e mette in coda i QSO registrati nel frattempo, con 5 minuti di margine. I QSO già
+  ricevuti (presenti in `qso_ricevuti.adi`) non vengono rimandati. I log vengono trovati da soli:
+  - WSJT-X e JTDX: `%LOCALAPPDATA%\WSJT-X\wsjtx_log.adi` e `%LOCALAPPDATA%\JTDX\wsjtx_log.adi` (percorso
+    fisso, non configurabile nei programmi), comprese le istanze avviate con `--rig-name`;
+  - MSHV: nella cartella di installazione, letta dal registro di Windows. Con l'opzione **Use Save QSOs
+    In ADIF Log** del menu del log (attiva di default) si usa `log\mshvlog.adi`, dove MSHV aggiunge ogni
+    QSO con il nominativo usato in quel momento. Se l'opzione è spenta si usa `log\mshvlog.edim`, che
+    non ha il nominativo di ogni QSO: si usa quello impostato in MSHV, come fa MSHV stesso. In questo
+    caso il listener salva anche il nominativo di MSHV insieme all'ultimo momento in ascolto: se al
+    riavvio è diverso, i QSO del periodo non vengono recuperati ma elencati in rosso, da controllare e
+    caricare a mano. Le correzioni fatte in MSHV a un QSO non arrivano in `mshvlog.adi`.
+
+  Al primo avvio non c'è un periodo da controllare. Se il programma gira su un altro PC il suo log non è
+  raggiungibile e il recupero non avviene.
 - **Importazione di un log ADIF pregresso**: carica solo i QSO con `STATION_CALLSIGN` uguale al nominativo
   impostato, con filtro facoltativo per date. I QSO vengono **uniti** al log esistente (nessuna
   cancellazione).
@@ -33,6 +52,9 @@ batch catch-up uploads (putlogs.php), ADIF import filtered by station callsign, 
 - **Modalità TEST**: riceve e mostra i QSO senza inviarli, per verificare la configurazione.
 - **Icona nella tray bar** con colore di stato (verde online, arancione test, rosso errore) e notifiche
   degli errori.
+- **Avvio con Windows** (spunta): all'accensione del PC il programma parte ridotto a icona; con
+  "Avvia ascolto all'apertura" riceve e invia i QSO senza toccare niente. La voce di avvio è una sola
+  per la versione Python e per quella C#: spuntandola in una si toglie dall'altra.
 - **Credenziali cifrate** con la protezione dati di Windows (DPAPI), legate all'utente del PC.
 
 ## Requisiti
@@ -51,6 +73,23 @@ Scarica il codice (pulsante verde **Code → Download ZIP**, oppure `git clone`)
 `avvia_listener.bat` o su `clublog_listener.pyw`.
 
 Impostazioni, coda e file generati vengono salvati nella stessa cartella del programma.
+
+## Versione C# (senza Python)
+
+La cartella [`csharp`](csharp) contiene lo stesso programma scritto in C#, per **.NET Framework 4.8**, che
+è già incluso in Windows 10 e 11: l'eseguibile gira su qualsiasi PC Windows senza installare niente, e
+l'icona nella tray bar c'è sempre.
+
+- Doppio clic su `csharp\compila.bat`: crea `csharp\ClubLogUniversalListener.exe` con il compilatore C#
+  che Windows contiene già.
+- L'icona del programma è `icona.ico` (tutti i formati da 16 a 256 pixel, per Esplora risorse,
+  desktop, barra delle applicazioni e Alt+Tab): la usano sia l'exe C# sia quello creato da `crea_exe.bat`.
+  Se manca, `compila.bat` la ricrea.
+- Stesse funzioni e stessi file dati della versione Python (impostazioni, coda, ADIF): passando da una
+  versione all'altra con lo stesso utente Windows, impostazioni e password cifrate restano valide.
+- Versione con API key integrata per il gruppo: `csharp\compila_con_chiave.bat` chiede la chiave la prima
+  volta (crea `csharp\chiave_api.cs`, escluso da git) e crea `csharp\dist\ClubLogUniversalListener.exe`,
+  da distribuire **solo al gruppo**.
 
 ## Credenziali Club Log
 
@@ -110,7 +149,8 @@ python simula_pacchetti.py JTDX QARTest          solo alcuni
 python simula_pacchetti.py --host 192.168.1.10   listener su un altro PC
 ```
 
-I QSO di prova finiscono anche in `qso_ricevuti.adi`: cancellalo dopo le prove.
+I QSO di prova finiscono anche in `qso_ricevuti.adi`: cancellalo dopo le prove, anche perché i QSO presenti
+in quel file risultano già ricevuti e non vengono recuperati dai log dei programmi.
 
 ## File creati dal programma
 
@@ -118,6 +158,7 @@ I QSO di prova finiscono anche in `qso_ricevuti.adi`: cancellalo dopo le prove.
 |---|---|
 | `clublog_listener.json` | Impostazioni (password e API key cifrate; la chiave integrata non viene mai salvata qui) |
 | `clublog_listener_coda.json` | QSO in attesa di invio |
+| `clublog_listener_stato.json` | Ultimo momento in ascolto per ogni programma (per il recupero dei QSO) |
 | `qso_ricevuti.adi` | Copia ADIF di tutti i QSO ricevuti |
 | `qso_rifiutati.adi` | QSO scartati da Club Log come non validi |
 | `caricamenti_in_attesa\` / `caricamenti_inviati\` | Log ADIF importati, prima e dopo l'invio |

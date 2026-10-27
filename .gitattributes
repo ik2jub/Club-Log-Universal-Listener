@@ -1,0 +1,2 @@
+# I file batch di Windows vogliono gli a capo CRLF (anche nello ZIP scaricato da GitHub)
+*.bat text eol=crlf

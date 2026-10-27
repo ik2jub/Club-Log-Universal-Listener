@@ -16,6 +16,7 @@ python -m pip install --upgrade --quiet pyinstaller pystray pillow || goto :erro
 echo Creazione dell'eseguibile...
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
     --name ClubLogUniversalListener --hidden-import chiave_api ^
+    --icon "%~dp0icona.ico" --add-data "%~dp0icona.ico;." ^
     --distpath dist --workpath build --specpath build ^
     clublog_listener.pyw || goto :errore
 

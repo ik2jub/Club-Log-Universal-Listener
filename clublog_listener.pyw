@@ -49,6 +49,9 @@ REJECTED_ADIF = os.path.join(BASE_DIR, "qso_rifiutati.adi")
 # File ADIF importati: restano qui finché Club Log non li accetta, poi vengono spostati
 JOBS_DIR = os.path.join(BASE_DIR, "caricamenti_in_attesa")
 JOBS_DONE_DIR = os.path.join(BASE_DIR, "caricamenti_inviati")
+# Ultimo momento in cui ogni programma era in ascolto: al riavvio si cercano nel suo log i QSO
+# registrati nel frattempo
+STATE_FILE = os.path.join(BASE_DIR, "clublog_listener_stato.json")
 
 # Programmi e porte di default. JTDX e MSHV usano di default la 2237 come
 # WSJT-X: qui si propongono porte diverse per farli convivere.
@@ -62,6 +65,8 @@ DEFAULT_LISTENERS = [
 
 DEDUP_WINDOW_S = 30 * 60
 HOLD_QSO_LOGGED_S = 3  # attesa del Logged ADIF dopo un QSO Logged di WSJT-X/JTDX
+ALIVE_EVERY_S = 60     # ogni quanto si salva l'ultimo momento in ascolto (copre spegnimenti e crash)
+GAP_MARGIN_S = 300     # margine prima dell'ultimo momento in ascolto: i doppioni vengono scartati
 PUTLOGS_URL = "https://clublog.org/putlogs.php"
 # Club Log non pubblica limiti numerici: chiede un ritmo "normale" per realtime.php,
 # putlogs.php per gli arretrati e nessun invio a blocchi ripetuto e ravvicinato.
@@ -419,8 +424,10 @@ class _Reader:
         self.pos += n
         return s
 
-    def qdatetime(self, stored_utc=False):
-        # stored_utc: schema 1 (Qt 5.0) scrive sempre l'ora UTC, qualunque sia il timespec
+    def qdatetime(self, stored_utc=False, local_is_utc=False):
+        # stored_utc: schema 1 (Qt 5.0) scrive sempre l'ora UTC, qualunque sia il timespec.
+        # local_is_utc: JTDX (finestra Log QSO) e MSHV prima della 2.68 marcano come ora locale
+        # le cifre dell'ora UTC
         jd = self.i64()
         ms = self.u32()
         spec = self.u8()
@@ -434,7 +441,7 @@ class _Reader:
         base = dt.datetime.fromordinal(jd - 1721425) + dt.timedelta(milliseconds=ms)
         if stored_utc:
             return base
-        if spec == 0:
+        if spec == 0 and not local_is_utc:
             base = base.astimezone(dt.timezone.utc).replace(tzinfo=None)
         elif spec == 2:
             base -= dt.timedelta(seconds=offset)
@@ -454,7 +461,8 @@ def parse_wsjtx(data):
     if mtype == 12:
         records = parse_adif(r.utf8())
     elif mtype == 5:
-        off = r.qdatetime(schema == 1)
+        utc_digits = client_id.upper().startswith(("JTDX", "MSHV"))
+        off = r.qdatetime(schema == 1, utc_digits)
         rec = {"call": r.utf8(), "gridsquare": r.utf8()}
         hz = r.u64()
         rec["mode"] = r.utf8()
@@ -463,7 +471,7 @@ def parse_wsjtx(data):
         r.utf8()  # tx power
         r.utf8()  # comments
         r.utf8()  # name
-        on = r.qdatetime(schema == 1)
+        on = r.qdatetime(schema == 1, utc_digits)
         try:
             rec["operator"] = r.utf8()
             rec["station_callsign"] = r.utf8()
@@ -557,13 +565,221 @@ def parse_packet(data):
 
 
 # --------------------------------------------------------------------------
+# Log dei programmi: QSO registrati mentre il listener non ascoltava
+# --------------------------------------------------------------------------
+
+# WSJT-X e JTDX scrivono sempre wsjtx_log.adi nella loro cartella dati (non configurabile);
+# con --rig-name=XXX la cartella è "<programma> - XXX". MSHV usa <cartella di MSHV>\log\mshvlog.edim.
+LOG_PROGRAMS = ("WSJT-X", "JTDX", "MSHV")
+
+# Codici dei modi nel log di MSHV (HvLogW::SaveEDI)
+MSHV_MODES = {"0": "NON", "1": "SSB", "2": "CW", "6": "FM", "10": "JTMS", "11": "FSK441",
+              "12": "ISCAT-A", "13": "ISCAT-B", "14": "JT6M", "15": "FSK315", "17": "MSK144",
+              "18": "JT65A", "19": "JT65B", "20": "JT65C", "21": "PI4", "22": "FT8", "23": "MSKMS",
+              "24": "FT4", "25": "Q65A", "26": "Q65B", "27": "Q65C", "28": "Q65D", "29": "FT2"}
+
+
+def mshv_dirs():
+    """Cartelle di installazione di MSHV, dalle voci di disinstallazione di Windows."""
+    dirs = []
+    try:
+        import winreg
+    except ImportError:
+        return dirs
+    for root, path in ((winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                       (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                       (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")):
+        try:
+            key = winreg.OpenKey(root, path)
+        except OSError:
+            continue
+        with key:
+            for i in range(winreg.QueryInfoKey(key)[0]):
+                try:
+                    with winreg.OpenKey(key, winreg.EnumKey(key, i)) as sub:
+                        if not str(winreg.QueryValueEx(sub, "DisplayName")[0]).upper().startswith("MSHV"):
+                            continue
+                        uninstall = str(winreg.QueryValueEx(sub, "UninstallString")[0]).strip().strip('"')
+                except OSError:
+                    continue
+                folder = os.path.dirname(uninstall)
+                if folder and folder.lower() not in [d.lower() for d in dirs]:
+                    dirs.append(folder)
+    return dirs
+
+
+def find_program_logs(program):
+    """File di log del programma su questo PC: lista di (percorso, tipo) con tipo "adif" o "mshv"."""
+    found = []
+    if program in ("WSJT-X", "JTDX"):
+        base = os.environ.get("LOCALAPPDATA", "")
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            names = []
+        for name in names:
+            if name.lower() == program.lower() or name.lower().startswith(program.lower() + " - "):
+                path = os.path.join(base, name, "wsjtx_log.adi")
+                if os.path.isfile(path):
+                    found.append((path, "adif"))
+    elif program == "MSHV":
+        # Con "Use Save QSOs In ADIF Log" (attiva di default) MSHV aggiunge ogni QSO a mshvlog.adi con il
+        # nominativo usato in quel momento: è la fonte migliore. Altrimenti si legge mshvlog.edim.
+        for folder in mshv_dirs():
+            adif = os.path.join(folder, "log", "mshvlog.adi")
+            edim = os.path.join(folder, "log", "mshvlog.edim")
+            if mshv_adif_enabled(folder) and os.path.isfile(adif):
+                found.append((adif, "adif"))
+            elif os.path.isfile(edim):
+                found.append((edim, "mshv"))
+    return found
+
+
+def mshv_adif_enabled(folder):
+    """Stato di "Use Save QSOs In ADIF Log" in settings\\ms_settings (se manca: attiva, come in MSHV)."""
+    try:
+        with open(os.path.join(folder, "settings", "ms_settings"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("def_use_adif_save="):
+                    return line.split("=", 1)[1].strip() != "0"
+    except OSError:
+        pass
+    return True
+
+
+def _mshv_freq(digits, mhz):
+    """Il log di MSHV salva la frequenza senza punto decimale: lo rimette dove la frequenza cade
+    nella banda indicata (es. 70154 con banda 70 MHz -> 70.154)."""
+    digits = digits.lstrip("0")
+    if not digits.isdigit():
+        return ""
+    candidates = ["0." + digits] + [digits[:k] + "." + digits[k:] for k in range(1, len(digits) + 1)]
+    for c in candidates:
+        v = float(c)
+        if abs(v - mhz) <= mhz * 0.15 and freq_to_band(v):
+            return "%.6f" % v
+    return ""
+
+
+def mshv_callsign(log_path):
+    """Nominativo impostato in MSHV (settings\\ms_macros, salvato appena si conferma la modifica)."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(log_path)), "settings", "ms_macros"),
+                  encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("macr_my_call="):
+                    return line.split("=", 1)[1].strip().upper()
+    except OSError:
+        pass
+    return ""
+
+
+def read_mshv_log(path):
+    """Record ADIF dal log di MSHV (mshvlog.edim), con gli stessi campi dell'ADIF di MSHV.
+    Il log non ha il nominativo di ogni QSO: si usa quello impostato in MSHV, come fa MSHV."""
+    mycall = mshv_callsign(path)
+    records, in_qsos = [], False
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\r\n")
+            if line.upper().startswith("[END;"):
+                in_qsos = False
+            if in_qsos and line:
+                p = line.split(";") + [""] * 29
+                sec_on = p[18] or "00"
+                sec_off = p[20] or sec_on
+                rec = {"call": p[4], "qso_date": p[0], "time_on": p[1] + sec_on, "qso_date_off": p[2],
+                       "time_off": p[3] + sec_off, "rst_sent": p[6], "rst_rcvd": p[7], "gridsquare": p[8]}
+                mode = MSHV_MODES.get(p[5], p[5])
+                if mode in ("FT2", "FT4") or mode.startswith("Q65"):
+                    rec["mode"], rec["submode"] = "MFSK", mode
+                elif mode.startswith("ISCAT"):
+                    rec["mode"], rec["submode"] = "ISCAT", mode
+                elif mode.startswith("JT65"):
+                    rec["mode"], rec["submode"] = "JT65", mode
+                else:
+                    rec["mode"] = mode
+                m = re.match(r"([\d.]+)\s*([kMG])", p[9], re.IGNORECASE)
+                if m:
+                    mhz = float(m.group(1)) * {"K": 0.001, "M": 1.0, "G": 1000.0}[m.group(2).upper()]
+                    freq = _mshv_freq(p[10], mhz)
+                    if freq:
+                        rec["freq"] = freq
+                        rec["band"] = freq_to_band(float(freq))
+                    else:
+                        near = [b for lo, hi, b in BANDS if lo * 0.9 <= mhz <= hi * 1.1]
+                        rec["band"] = near[0] if near else ""
+                if p[12]:
+                    rec["prop_mode"] = p[12]
+                if p[22]:
+                    rec["sat_name"] = p[22]
+                if mycall:
+                    rec["station_callsign"] = mycall
+                records.append(rec)
+            if line.upper().startswith("[QSORECORDS;"):
+                in_qsos = True
+    return records
+
+
+def read_program_log(path, kind):
+    if kind == "mshv":
+        return read_mshv_log(path)
+    with open(path, "rb") as f:
+        return parse_adif(f.read())
+
+
+def qso_timestamp(rec):
+    """Momento della registrazione del QSO (fine QSO, o inizio se manca), in secondi UTC."""
+    date, t = rec.get("qso_date_off", ""), rec.get("time_off", "")
+    if len(date) != 8 or len(t) < 4:
+        date, t = rec.get("qso_date", ""), rec.get("time_on", "")
+    try:
+        return dt.datetime.strptime(date + t[:6].ljust(6, "0"), "%Y%m%d%H%M%S").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def qso_key(rec):
+    """Chiave dei doppioni: stesso nominativo, data, ora (al minuto), banda e modo."""
+    return "|".join((rec["call"], rec["qso_date"], rec["time_on"][:4], rec["band"],
+                     rec.get("submode") or rec["mode"]))
+
+
+def load_state():
+    """(ultimo momento in ascolto per programma, nominativo di MSHV in quel momento per log)."""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}, {}
+    try:
+        times = {k: float(v) for k, v in data.get("ultimo_ascolto", {}).items()}
+    except (AttributeError, TypeError, ValueError):
+        times = {}
+    try:
+        calls = {k: str(v) for k, v in data.get("nominativo_mshv", {}).items()}
+    except (AttributeError, TypeError):
+        calls = {}
+    return times, calls
+
+
+def save_state(times, calls):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"ultimo_ascolto": times, "nominativo_mshv": calls}, f, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+# --------------------------------------------------------------------------
 # Thread di ascolto UDP
 # --------------------------------------------------------------------------
 
 class Listener(threading.Thread):
-    def __init__(self, idx, cfg, on_qso, emit):
+    def __init__(self, idx, cfg, on_qso, emit, on_alive=None):
         super().__init__(daemon=True)
         self.idx, self.cfg, self.on_qso, self.emit = idx, cfg, on_qso, emit
+        self.on_alive = on_alive or (lambda name: None)
         self.stop_event = threading.Event()
         self.sock = None
         # QSO Logged in attesa del Logged ADIF dello stesso QSO: (scadenza, chiave, rec, proto, ip)
@@ -594,9 +810,14 @@ class Listener(threading.Thread):
         where = "%s:%d" % (ip, port) + (" + multicast %s" % mcast if mcast else "")
         self.status("In ascolto su %s - nessun pacchetto" % where, "ok")
         self.log("info", "in ascolto su %s" % where)
+        self.on_alive(self.cfg["name"])
+        alive_at = time.time()
 
         while not self.stop_event.is_set():
             self._release_held()
+            if time.time() - alive_at >= ALIVE_EVERY_S:
+                self.on_alive(self.cfg["name"])
+                alive_at = time.time()
             try:
                 data, addr = self.sock.recvfrom(65535)
             except socket.timeout:
@@ -630,6 +851,7 @@ class Listener(threading.Thread):
                 self.on_qso(rec, self.cfg["name"], "%s %s" % (proto, msg), addr[0])
 
         self._release_held(force=True)
+        self.on_alive(self.cfg["name"])
         try:
             self.sock.close()
         except OSError:
@@ -929,6 +1151,8 @@ class Engine:
         self.callsign = ""
         self.include_freq = True
         self.dry_run = True
+        self.state, self.mshv_calls = load_state()
+        self.state_lock = threading.Lock()
 
     def start(self, settings, listener_cfgs):
         self.callsign = settings["callsign"].upper()
@@ -936,10 +1160,105 @@ class Engine:
         self.dry_run = settings["dry_run"]
         self.uploader.configure(settings, settings["dry_run"])
         self.uploader.resume()
+        # Periodo da controllare nei log: dall'ultimo momento in ascolto a adesso
+        now = time.time()
+        with self.state_lock:
+            gaps = [(cfg["name"], self.state.get(cfg["name"])) for _, cfg in listener_cfgs
+                    if cfg["name"] in LOG_PROGRAMS]
+            calls_before = dict(self.mshv_calls)  # nominativo di MSHV all'ultimo momento in ascolto
         for idx, cfg in listener_cfgs:
-            lst = Listener(idx, cfg, self.handle_qso, self.emit)
+            lst = Listener(idx, cfg, self.handle_qso, self.emit, self.alive)
             lst.start()
             self.listeners.append(lst)
+        if gaps:
+            threading.Thread(target=self.scan_logs, args=(gaps, now, calls_before), daemon=True).start()
+
+    def alive(self, program):
+        calls = {}
+        if program == "MSHV":
+            for folder in mshv_dirs():
+                path = os.path.join(folder, "log", "mshvlog.edim")  # chiave: il log che non ha il nominativo
+                call = mshv_callsign(path)
+                if call:
+                    calls[path] = call
+        with self.state_lock:
+            self.state[program] = time.time()
+            self.mshv_calls.update(calls)
+            try:
+                save_state(self.state, self.mshv_calls)
+            except OSError as e:
+                self.emit(("log", "warn", "impossibile salvare %s: %s" % (STATE_FILE, e)))
+
+    def scan_logs(self, gaps, until, calls_before=None):
+        """Mette in coda i QSO registrati nei log di WSJT-X/JTDX/MSHV mentre il listener non ascoltava."""
+        known = None
+        for program, last in gaps:
+            if last is None:
+                self.emit(("log", "info", "[%s] primo avvio: da ora i QSO registrati a listener spento "
+                                          "verranno recuperati dal log del programma" % program))
+                continue
+            since = last - GAP_MARGIN_S
+            period = "%s - %s UTC" % (time.strftime("%Y-%m-%d %H:%M", time.gmtime(last)),
+                                      time.strftime("%Y-%m-%d %H:%M", time.gmtime(until)))
+            files = find_program_logs(program)
+            if not files:
+                self.emit(("log", "info", "[%s] log del programma non trovato su questo PC: nessun "
+                                          "recupero dei QSO registrati a listener spento" % program))
+                continue
+            if known is None:
+                known = self._received_keys()
+            for path, kind in files:
+                try:
+                    records = read_program_log(path, kind)
+                except OSError as e:
+                    self.emit(("log", "warn", "[%s] impossibile leggere il log %s: %s" % (program, path, e)))
+                    continue
+                pending = []
+                for raw in records:
+                    t = qso_timestamp({k.lower(): str(v).strip() for k, v in raw.items()})
+                    if t is None or not since <= t <= until:
+                        continue
+                    rec, err = normalize_record(raw, self.include_freq)
+                    if rec and qso_key(rec) in known:
+                        continue  # già ricevuto via UDP prima dello spegnimento
+                    pending.append((raw, rec))
+                found = len(pending)
+                # Il log di MSHV non ha il nominativo di ogni QSO: se in MSHV è stato cambiato mentre il
+                # listener non ascoltava, non si sa con quale nominativo è stato fatto ciascun QSO
+                before = (calls_before or {}).get(path, "")
+                now_call = mshv_callsign(path) if kind == "mshv" else ""
+                if pending and before and now_call and before != now_call:
+                    self.stats["errors"] += 1
+                    self.emit(("log", "err", "[%s] nominativo cambiato in MSHV mentre il listener era spento "
+                                             "(%s -> %s): %d QSO del periodo %s NON recuperati, perché non si sa "
+                                             "con quale nominativo sono stati fatti. Controllali in MSHV, esportali "
+                                             "in ADIF e caricali con \"Importa log ADIF...\":"
+                               % (program, before, now_call, found, period)))
+                    for raw, rec in pending:
+                        self.emit(("log", "err", "        %s" % (describe(rec) if rec else raw)))
+                    continue
+                for raw, rec in pending:
+                    self.handle_qso(raw, program, "log a listener spento", path)
+                if found:
+                    self.emit(("log", "warn", "[%s] %d QSO registrati a listener spento (%s) recuperati dal log %s"
+                               % (program, found, period, path)))
+                else:
+                    self.emit(("log", "info", "[%s] nessun QSO registrato a listener spento (%s) nel log %s"
+                               % (program, period, path)))
+
+    def _received_keys(self):
+        """Chiavi dei QSO già ricevuti, dalla copia qso_ricevuti.adi."""
+        keys = set()
+        try:
+            with open(BACKUP_ADIF, "rb") as f:
+                data = f.read()
+        except OSError:
+            return keys
+        for raw in parse_adif(data):
+            rec, err = normalize_record(raw, True)
+            if rec:
+                keys.add(qso_key(rec))
+        return keys
 
     def stop(self):
         for lst in self.listeners:
@@ -966,8 +1285,7 @@ class Engine:
             self.emit(("log", "err", "[%s] QSO scartato: STATION_CALLSIGN %s diverso dal nominativo DX %s - %s"
                        % (program, station, self.callsign, describe(rec))))
             return
-        key = "|".join((rec["call"], rec["qso_date"], rec["time_on"][:4], rec["band"],
-                        rec.get("submode") or rec["mode"]))
+        key = qso_key(rec)
         now = time.time()
         with self.lock:
             self.seen = {k: t for k, t in self.seen.items() if now - t < DEDUP_WINDOW_S}
@@ -999,8 +1317,8 @@ class Engine:
 # --------------------------------------------------------------------------
 
 def load_config():
-    cfg = {"callsign": "", "email": "", "password": "", "api": "", "include_freq": True,
-           "dry_run": True, "autostart": False, "tray": True,
+    cfg = {"callsign": "", "email": "", "password": "", "api": "", "include_freq": False,
+           "dry_run": False, "autostart": False, "tray": False,
            "interval": DEFAULT_INTERVAL_S, "batch": DEFAULT_BATCH_THRESHOLD,
            "listeners": [dict(d) for d in DEFAULT_LISTENERS]}
     try:
@@ -1037,6 +1355,81 @@ def local_ipv4_addresses():
     return sorted(addrs, key=lambda a: (a != "0.0.0.0", a != "127.0.0.1", a))
 
 
+def monitor_work_area(x, y):
+    """Area libera (esclusa la barra delle applicazioni) del monitor che contiene il punto x, y."""
+    if os.name == "nt":
+        try:
+            from ctypes import wintypes
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            user32.MonitorFromPoint.restype = wintypes.HMONITOR
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)]
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            mon = user32.MonitorFromPoint(wintypes.POINT(x, y), 2)  # 2 = il monitor più vicino
+            if user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+                r = info.rcWork
+                return r.left, r.top, r.right - r.left, r.bottom - r.top
+        except Exception:
+            pass
+    return None
+
+
+# Avvio con Windows: voce in HKCU\...\Run, la stessa per la versione Python e per quella C#, così
+# all'accensione parte un solo programma (le porte UDP sono le stesse)
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = APP_NAME
+STARTUP_ARG = "--avvio-windows"  # avviato da Windows: si apre ridotto a icona
+
+
+def startup_target():
+    return os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
+
+
+def startup_command():
+    if getattr(sys, "frozen", False):
+        return '"%s" %s' % (startup_target(), STARTUP_ARG)
+    # pythonw: nessuna finestra nera del prompt all'avvio
+    exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(exe):
+        exe = sys.executable
+    return '"%s" "%s" %s' % (exe, startup_target(), STARTUP_ARG)
+
+
+def startup_entry():
+    """Comando registrato per l'avvio con Windows ("" se non c'è)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            return str(winreg.QueryValueEx(key, RUN_VALUE)[0])
+    except OSError:
+        return ""
+
+
+def startup_is_mine(command):
+    return startup_target().lower() in command.lower()
+
+
+def set_startup(enabled):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, startup_command())
+        elif startup_is_mine(startup_entry()):
+            winreg.DeleteValue(key, RUN_VALUE)
+
+
+def icon_path():
+    """icona.ico accanto allo script, o dentro l'exe creato da crea_exe.bat."""
+    path = os.path.join(getattr(sys, "_MEIPASS", BASE_DIR), "icona.ico")
+    return path if os.path.exists(path) else ""
+
+
 def tray_image(color):
     """Icona tonda con la scritta CL, colorata secondo lo stato."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -1065,16 +1458,68 @@ def run_gui():
 
     root = tk.Tk()
     root.title("%s %s" % (APP_NAME, APP_VERSION))
-    root.minsize(980, 640)
+    if icon_path():
+        try:
+            root.iconbitmap(default=icon_path())  # vale anche per la finestra di importazione
+        except tk.TclError:
+            pass
     style = ttk.Style(root)
     if "vista" in style.theme_names():
         style.theme_use("vista")
 
     COLORS = {"info": "#333333", "ok": "#1a7f37", "warn": "#b35900", "err": "#c62828", "rx": "#0b57d0"}
 
-    # --- Credenziali Club Log ---
-    cred = ttk.LabelFrame(root, text=" Club Log ", padding=8)
-    cred.pack(fill="x", padx=10, pady=(10, 5))
+    # --- Contenuto scorrevole: se la finestra è più piccola compaiono le barre di scorrimento ---
+    canvas = tk.Canvas(root, highlightthickness=0, borderwidth=0)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    root.rowconfigure(0, weight=1)
+    root.columnconfigure(0, weight=1)
+    vbar = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
+    hbar = ttk.Scrollbar(root, orient="horizontal", command=canvas.xview)
+    canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    body = ttk.Frame(canvas)
+    body_id = canvas.create_window(0, 0, window=body, anchor="nw")
+    body_req = {}
+
+    def fit_body(event=None):
+        # Spazio totale, contando anche le barre già visibili: così non compaiono e spariscono a vicenda
+        total_w = canvas.winfo_width() + (vbar.winfo_width() if vbar.winfo_ismapped() else 0)
+        total_h = canvas.winfo_height() + (hbar.winfo_height() if hbar.winfo_ismapped() else 0)
+        req_w, req_h = body.winfo_reqwidth(), body.winfo_reqheight()
+        sb = vbar.winfo_reqwidth()
+        need_h = req_w > total_w
+        need_v = req_h > total_h - (sb if need_h else 0)
+        need_h = req_w > total_w - (sb if need_v else 0)
+        for bar_, need, place in ((vbar, need_v, dict(row=0, column=1, sticky="ns")),
+                                  (hbar, need_h, dict(row=1, column=0, sticky="ew"))):
+            if need and not bar_.winfo_ismapped():
+                bar_.grid(**place)
+            elif not need and bar_.winfo_ismapped():
+                bar_.grid_remove()
+        w = max(total_w - (sb if need_v else 0), req_w)
+        h = max(total_h - (sb if need_h else 0), req_h)
+        canvas.itemconfigure(body_id, width=w, height=h)
+        canvas.configure(scrollregion=(0, 0, w, h))
+        body_req["size"] = (req_w, req_h)
+
+    canvas.bind("<Configure>", fit_body)
+
+    def on_wheel(event):
+        w = event.widget
+        if not vbar.winfo_ismapped() or isinstance(w, str) or w.winfo_toplevel() is not root or \
+                str(w).startswith(str(txt)):
+            return  # la rotellina sui messaggi scorre i messaggi
+        canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1), "units")
+
+    root.bind_all("<MouseWheel>", on_wheel)
+
+    # --- Schede: Club Log e UDP ---
+    nb = ttk.Notebook(body)
+    nb.pack(fill="x", padx=10, pady=(10, 5))
+    cred = ttk.Frame(nb, padding=8)
+    nb.add(cred, text="Club Log")
+    lf = ttk.Frame(nb, padding=8)
+    nb.add(lf, text="UDP")
 
     v_call = tk.StringVar(value=cfg["callsign"])
     v_email = tk.StringVar(value=cfg["email"])
@@ -1088,22 +1533,24 @@ def run_gui():
     v_interval = tk.StringVar(value=str(cfg["interval"]))
     v_batch = tk.StringVar(value=str(cfg["batch"]))
 
-    ttk.Label(cred, text="Nominativo DX:").grid(row=0, column=0, sticky="e")
-    e_call = ttk.Entry(cred, textvariable=v_call, width=16)
-    e_call.grid(row=0, column=1, sticky="w", padx=(4, 16))
-    ttk.Label(cred, text="Email Club Log:").grid(row=0, column=2, sticky="e")
-    e_email = ttk.Entry(cred, textvariable=v_email, width=32)
-    e_email.grid(row=0, column=3, sticky="w", padx=(4, 16))
-
-    ttk.Label(cred, text="App password:").grid(row=1, column=0, sticky="e", pady=(6, 0))
-    e_pwd = ttk.Entry(cred, textvariable=v_pwd, width=32, show="•")
-    e_pwd.grid(row=1, column=1, sticky="w", padx=(4, 16), pady=(6, 0))
-    ttk.Label(cred, text="API key:").grid(row=1, column=2, sticky="e", pady=(6, 0))
+    # A sinistra i campi in colonna, a destra le opzioni in colonna
+    fields = ttk.Frame(cred)
+    fields.grid(row=0, column=0, sticky="nw", padx=(0, 24))
+    ttk.Label(fields, text="Nominativo DX:").grid(row=0, column=0, sticky="e")
+    e_call = ttk.Entry(fields, textvariable=v_call, width=16)
+    e_call.grid(row=0, column=1, columnspan=3, sticky="w", padx=4)
+    ttk.Label(fields, text="Email Club Log:").grid(row=1, column=0, sticky="e", pady=(6, 0))
+    e_email = ttk.Entry(fields, textvariable=v_email, width=40)
+    e_email.grid(row=1, column=1, columnspan=3, sticky="w", padx=4, pady=(6, 0))
+    ttk.Label(fields, text="App password:").grid(row=2, column=0, sticky="e", pady=(6, 0))
+    e_pwd = ttk.Entry(fields, textvariable=v_pwd, width=40, show="•")
+    e_pwd.grid(row=2, column=1, columnspan=3, sticky="w", padx=4, pady=(6, 0))
+    ttk.Label(fields, text="API key:").grid(row=3, column=0, sticky="e", pady=(6, 0))
     if BUILTIN_API_KEY:
-        e_api = ttk.Label(cred, text="integrata nel programma", foreground=COLORS["ok"])
+        e_api = ttk.Label(fields, text="integrata nel programma", foreground=COLORS["ok"])
     else:
-        e_api = ttk.Entry(cred, textvariable=v_api, width=44, show="•")
-    e_api.grid(row=1, column=3, sticky="w", padx=(4, 16), pady=(6, 0))
+        e_api = ttk.Entry(fields, textvariable=v_api, width=40, show="•")
+    e_api.grid(row=3, column=1, columnspan=3, sticky="w", padx=4, pady=(6, 0))
 
     def toggle_show():
         ch = "" if v_show.get() else "•"
@@ -1112,33 +1559,53 @@ def run_gui():
             e_api.configure(show=ch)
 
     opts = ttk.Frame(cred)
-    opts.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
-    c_show = ttk.Checkbutton(opts, text="Mostra password/chiave", variable=v_show, command=toggle_show)
-    c_show.pack(side="left", padx=(0, 16))
-    c_freq = ttk.Checkbutton(opts, text="Invia la frequenza", variable=v_freq)
-    c_freq.pack(side="left", padx=(0, 16))
-    c_dry = ttk.Checkbutton(opts, text="Modalità TEST (riceve ma NON invia a Club Log)", variable=v_dry)
-    c_dry.pack(side="left", padx=(0, 16))
+    opts.grid(row=0, column=1, sticky="nw")
     c_auto = ttk.Checkbutton(opts, text="Avvia ascolto all'apertura", variable=v_auto)
-    c_auto.pack(side="left", padx=(0, 16))
+    c_auto.pack(anchor="w", pady=1)
+    c_freq = ttk.Checkbutton(opts, text="Invia la frequenza", variable=v_freq)
+    c_freq.pack(anchor="w", pady=1)
+    c_show = ttk.Checkbutton(opts, text="Mostra password/chiave", variable=v_show, command=toggle_show)
+    c_show.pack(anchor="w", pady=1)
     c_tray = ttk.Checkbutton(opts, text="Riduci a icona nella tray bar", variable=v_tray,
                              state="normal" if pystray else "disabled")
-    c_tray.pack(side="left")
+    c_tray.pack(anchor="w", pady=1)
+    boot_entry = startup_entry()
+    v_boot = tk.BooleanVar(value=bool(boot_entry) and startup_is_mine(boot_entry))
 
-    rate = ttk.Frame(cred)
-    rate.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
-    ttk.Label(rate, text="Pausa minima tra due invii:").pack(side="left")
-    e_interval = ttk.Spinbox(rate, from_=1, to=600, textvariable=v_interval, width=5)
-    e_interval.pack(side="left", padx=4)
-    ttk.Label(rate, text="s").pack(side="left", padx=(0, 24))
-    ttk.Label(rate, text="Invio a blocchi (putlogs) da").pack(side="left")
-    e_batch = ttk.Spinbox(rate, from_=0, to=10000, textvariable=v_batch, width=6)
-    e_batch.pack(side="left", padx=4)
-    ttk.Label(rate, text="QSO in coda in su (0 = mai)").pack(side="left")
+    def toggle_boot():
+        on = v_boot.get()
+        other = startup_entry()
+        try:
+            set_startup(on)
+        except OSError as e:
+            v_boot.set(not on)
+            messagebox.showerror(APP_NAME, "Impossibile modificare l'avvio con Windows:\n%s" % e)
+            return
+        if on:
+            if other and not startup_is_mine(other):
+                add_log("warn", "Avvio con Windows: sostituito il programma registrato prima (%s)" % other)
+            add_log("ok", "Avvio con Windows attivato: all'accensione il programma si apre ridotto a icona"
+                    + ("" if v_auto.get() else " (attiva anche \"Avvia ascolto all'apertura\" per "
+                       "ricevere i QSO senza toccare niente)"))
+        else:
+            add_log("info", "Avvio con Windows disattivato")
 
-    # --- Listener ---
-    lf = ttk.LabelFrame(root, text=" Porte UDP in ascolto ", padding=8)
-    lf.pack(fill="x", padx=10, pady=5)
+    c_boot = ttk.Checkbutton(opts, text="Avvia con Windows", variable=v_boot, command=toggle_boot,
+                             state="normal" if os.name == "nt" else "disabled")
+    c_boot.pack(anchor="w", pady=1)
+    c_dry = ttk.Checkbutton(opts, text="Modalità TEST (non invia a Club Log)", variable=v_dry)
+    c_dry.pack(anchor="w", pady=(12, 1))  # in fondo, un po' staccata dalle altre
+
+    ttk.Label(fields, text="Pausa tra due invii:").grid(row=4, column=0, sticky="e", pady=(10, 0))
+    e_interval = ttk.Spinbox(fields, from_=1, to=600, textvariable=v_interval, width=6)
+    e_interval.grid(row=4, column=1, sticky="w", padx=4, pady=(10, 0))
+    ttk.Label(fields, text="secondi (minimo)").grid(row=4, column=2, sticky="w", pady=(10, 0))
+    ttk.Label(fields, text="Invio a blocchi da:").grid(row=5, column=0, sticky="e", pady=(6, 0))
+    e_batch = ttk.Spinbox(fields, from_=0, to=10000, textvariable=v_batch, width=6)
+    e_batch.grid(row=5, column=1, sticky="w", padx=4, pady=(6, 0))
+    ttk.Label(fields, text="QSO in coda (0 = mai)").grid(row=5, column=2, sticky="w", pady=(6, 0))
+
+    # --- Porte UDP in ascolto ---
     for col, title in enumerate(["Attivo", "Programma", "Interfaccia (IP)", "Porta", "Multicast (opz.)", "Stato"]):
         ttk.Label(lf, text=title, font=("Segoe UI", 9, "bold")).grid(row=0, column=col, sticky="w", padx=4)
     lf.columnconfigure(5, weight=1)
@@ -1160,12 +1627,13 @@ def run_gui():
         r["w_port"].grid(row=i + 1, column=3, padx=4)
         r["w_mcast"] = ttk.Entry(lf, textvariable=r["mcast"], width=14)
         r["w_mcast"].grid(row=i + 1, column=4, padx=4)
-        r["status"] = tk.Label(lf, text="Fermo", anchor="w", fg=COLORS["info"])
+        # width fissa: un testo di stato lungo non deve allargare la finestra
+        r["status"] = tk.Label(lf, text="Fermo", anchor="w", fg=COLORS["info"], width=24)
         r["status"].grid(row=i + 1, column=5, sticky="we", padx=4)
         rows.append(r)
 
     # --- Barra comandi e contatori ---
-    bar = ttk.Frame(root, padding=(10, 2))
+    bar = ttk.Frame(body, padding=(10, 2))
     bar.pack(fill="x")
     b_start = ttk.Button(bar, text="▶ Avvia ascolto")
     b_start.pack(side="left")
@@ -1174,21 +1642,24 @@ def run_gui():
     b_retry = ttk.Button(bar, text="Riprova coda")
     b_retry.pack(side="left")
     b_import = ttk.Button(bar, text="Importa log ADIF...")
-    b_import.pack(side="left", padx=(6, 0))
-    b_save = ttk.Button(bar, text="Salva impostazioni")
-    b_save.pack(side="left", padx=6)
+    b_import.pack(side="left", padx=6)
     b_folder = ttk.Button(bar, text="Apri cartella dati")
     b_folder.pack(side="left")
-    v_counters = tk.StringVar()
-    ttk.Label(bar, textvariable=v_counters, font=("Segoe UI", 10, "bold")).pack(side="right")
+
+    # --- Stato e contatori, in fondo alla finestra ---
+    status = ttk.Frame(body, padding=(10, 0, 10, 6))
+    status.pack(side="bottom", fill="x")
     v_mode = tk.StringVar()
-    l_mode = tk.Label(bar, textvariable=v_mode, font=("Segoe UI", 10, "bold"))
-    l_mode.pack(side="right", padx=12)
+    l_mode = tk.Label(status, textvariable=v_mode, font=("Segoe UI", 10, "bold"))
+    l_mode.pack(side="left", padx=(0, 12))
+    v_counters = tk.StringVar()
+    ttk.Label(status, textvariable=v_counters, font=("Segoe UI", 10, "bold")).pack(side="left")
 
     # --- Log ---
-    logf = ttk.LabelFrame(root, text=" Messaggi  (Alt+W per cancellare) ", padding=4)
+    logf = ttk.LabelFrame(body, text=" Messaggi  (Alt+W per cancellare) ", padding=4)
     logf.pack(fill="both", expand=True, padx=10, pady=(5, 10))
-    txt = ScrolledText(logf, height=16, font=("Consolas", 9), state="disabled", wrap="word")
+    # height piccola: è la misura minima, l'area messaggi si allarga con la finestra
+    txt = ScrolledText(logf, height=6, font=("Consolas", 9), state="disabled", wrap="word")
     txt.pack(fill="both", expand=True)
     for lvl, color in COLORS.items():
         txt.tag_configure(lvl, foreground=color)
@@ -1285,8 +1756,23 @@ def run_gui():
         b_start.configure(state="disabled" if running else "normal")
         b_stop.configure(state="normal" if running else "disabled")
 
-    def do_save(quiet=False):
+    # Salvataggio automatico a ogni modifica. I numeri non ancora validi (es. mentre si scrive)
+    # mantengono l'ultimo valore valido.
+    last_good = {"interval": cfg["interval"], "batch": cfg["batch"]}
+    save_job = {"id": None, "error": False}
+
+    def do_save(quiet=True):
+        save_job["id"] = None
         c = collect()
+        for key, lo, hi in (("interval", 1, 600), ("batch", 0, 10000)):
+            try:
+                value = int(c[key])
+                if not lo <= value <= hi:
+                    raise ValueError
+                last_good[key] = value
+            except ValueError:
+                pass
+            c[key] = last_good[key]
         for l in c["listeners"]:
             try:
                 l["port"] = int(l["port"])
@@ -1294,10 +1780,20 @@ def run_gui():
                 pass
         try:
             save_config(c)
-            if not quiet:
-                add_log("info", "Impostazioni salvate in %s" % CONFIG_FILE)
+            save_job["error"] = False
         except OSError as e:
-            add_log("err", "Impossibile salvare le impostazioni: %s" % e)
+            if not save_job["error"]:  # una sola segnalazione finché il problema resta
+                add_log("err", "Impossibile salvare le impostazioni: %s" % e)
+            save_job["error"] = True
+
+    def schedule_save(*_):
+        if save_job["id"]:
+            root.after_cancel(save_job["id"])
+        save_job["id"] = root.after(500, do_save)
+
+    for var in [v_call, v_email, v_pwd, v_api, v_freq, v_dry, v_auto, v_tray, v_interval, v_batch] + \
+            [r[k] for r in rows for k in ("enabled", "ip", "port", "mcast")]:
+        var.trace_add("write", schedule_save)
 
     def do_start():
         c = collect()
@@ -1456,7 +1952,6 @@ def run_gui():
     b_stop.configure(command=do_stop)
     b_retry.configure(command=do_retry)
     b_import.configure(command=do_import)
-    b_save.configure(command=do_save)
     b_folder.configure(command=do_folder)
 
     # --- Tray bar ---
@@ -1538,6 +2033,8 @@ def run_gui():
             if tray["title"] != title:
                 tray["icon"].title = title
                 tray["title"] = title
+        if body_req.get("size") != (body.winfo_reqwidth(), body.winfo_reqheight()):
+            fit_body()
         root.after(150, poll)
 
     def on_close():
@@ -1559,6 +2056,24 @@ def run_gui():
         add_log("warn", "%d QSO in coda dalla sessione precedente: verranno inviati all'avvio."
                 % engine.uploader.pending())
     poll()
+    # Misura iniziale adattata all'area libera del monitor su cui si apre, finestra centrata
+    root.update_idletasks()  # dopo poll(): i contatori sono già scritti
+    area = monitor_work_area(root.winfo_pointerx(), root.winfo_pointery()) or \
+        (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
+    scale = root.winfo_fpixels("1i") / 96.0
+    frame_w, frame_h = int(16 * scale), int(39 * scale)  # bordi e barra del titolo
+    width = min(body.winfo_reqwidth(), area[2] - frame_w)
+    height = min(body.winfo_reqheight() + int(220 * scale), area[3] - frame_h)
+    root.minsize(min(int(420 * scale), width), min(int(320 * scale), height))
+    root.geometry("%dx%d+%d+%d" % (width, height, area[0] + (area[2] - width - frame_w) // 2,
+                                    area[1] + (area[3] - height - frame_h) // 2))
+    if STARTUP_ARG in sys.argv[1:]:
+        # Avviato da Windows: solo l'icona nella tray (o nella barra delle applicazioni)
+        if tray["icon"] and v_tray.get():
+            tray["hidden"] = True
+            root.withdraw()
+        else:
+            root.iconify()
     if cfg["autostart"]:
         root.after(300, do_start)
     root.mainloop()

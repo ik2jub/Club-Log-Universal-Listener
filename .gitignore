@@ -4,6 +4,8 @@ clublog_listener.json
 # Coda dei QSO e file generati in esecuzione
 clublog_listener_coda.json
 clublog_listener_coda.json.*
+clublog_listener_stato.json
+clublog_listener_stato.json.tmp
 *.adi
 *.adif
 caricamenti_in_attesa/
@@ -15,6 +17,7 @@ __pycache__/
 
 # API key integrata ed eseguibile che la contiene: solo per il gruppo, mai su GitHub
 chiave_api.py
+chiave_api.cs
 build/
 dist/
 *.spec
