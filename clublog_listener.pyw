@@ -61,6 +61,7 @@ DEFAULT_LISTENERS = [
 ]
 
 DEDUP_WINDOW_S = 30 * 60
+HOLD_QSO_LOGGED_S = 3  # attesa del Logged ADIF dopo un QSO Logged di WSJT-X/JTDX
 PUTLOGS_URL = "https://clublog.org/putlogs.php"
 # Club Log non pubblica limiti numerici: chiede un ritmo "normale" per realtime.php,
 # putlogs.php per gli arretrati e nessun invio a blocchi ripetuto e ravvicinato.
@@ -418,7 +419,8 @@ class _Reader:
         self.pos += n
         return s
 
-    def qdatetime(self):
+    def qdatetime(self, stored_utc=False):
+        # stored_utc: schema 1 (Qt 5.0) scrive sempre l'ora UTC, qualunque sia il timespec
         jd = self.i64()
         ms = self.u32()
         spec = self.u8()
@@ -430,6 +432,8 @@ class _Reader:
         if jd <= 0 or ms == 0xFFFFFFFF:
             return None
         base = dt.datetime.fromordinal(jd - 1721425) + dt.timedelta(milliseconds=ms)
+        if stored_utc:
+            return base
         if spec == 0:
             base = base.astimezone(dt.timezone.utc).replace(tzinfo=None)
         elif spec == 2:
@@ -442,7 +446,7 @@ def parse_wsjtx(data):
     r = _Reader(data)
     if r.u32() != WSJTX_MAGIC:
         raise ValueError("magic errato")
-    r.u32()  # schema
+    schema = r.u32()
     mtype = r.u32()
     client_id = r.utf8()
     name = WSJTX_TYPES.get(mtype, "tipo %d" % mtype)
@@ -450,7 +454,7 @@ def parse_wsjtx(data):
     if mtype == 12:
         records = parse_adif(r.utf8())
     elif mtype == 5:
-        off = r.qdatetime()
+        off = r.qdatetime(schema == 1)
         rec = {"call": r.utf8(), "gridsquare": r.utf8()}
         hz = r.u64()
         rec["mode"] = r.utf8()
@@ -459,7 +463,7 @@ def parse_wsjtx(data):
         r.utf8()  # tx power
         r.utf8()  # comments
         r.utf8()  # name
-        on = r.qdatetime()
+        on = r.qdatetime(schema == 1)
         try:
             rec["operator"] = r.utf8()
             rec["station_callsign"] = r.utf8()
@@ -562,6 +566,8 @@ class Listener(threading.Thread):
         self.idx, self.cfg, self.on_qso, self.emit = idx, cfg, on_qso, emit
         self.stop_event = threading.Event()
         self.sock = None
+        # QSO Logged in attesa del Logged ADIF dello stesso QSO: (scadenza, chiave, rec, proto, ip)
+        self.held = []
 
     def status(self, text, level="info"):
         self.emit(("lstatus", self.idx, text, level))
@@ -590,6 +596,7 @@ class Listener(threading.Thread):
         self.log("info", "in ascolto su %s" % where)
 
         while not self.stop_event.is_set():
+            self._release_held()
             try:
                 data, addr = self.sock.recvfrom(65535)
             except socket.timeout:
@@ -611,13 +618,30 @@ class Listener(threading.Thread):
             if proto == "N1MM-XML" and msg == "contactdelete":
                 self.log("warn", "cancellazione QSO ricevuta: va eliminato a mano su Club Log")
             for rec in recs:
+                key = (addr[0], info, (rec.get("call") or "").upper())
+                if proto == "WSJT-X" and msg == "QSO Logged":
+                    # WSJT-X/JTDX mandano subito dopo lo stesso QSO in ADIF, che ha l'orario UTC
+                    # esplicito: se arriva si usa quello (JTDX può dare un orario sbagliato qui)
+                    self.held.append((time.time() + HOLD_QSO_LOGGED_S, key, rec, "%s %s" % (proto, msg),
+                                      addr[0]))
+                    continue
+                if proto == "WSJT-X" and msg == "Logged ADIF":
+                    self.held = [h for h in self.held if h[1] != key]
                 self.on_qso(rec, self.cfg["name"], "%s %s" % (proto, msg), addr[0])
 
+        self._release_held(force=True)
         try:
             self.sock.close()
         except OSError:
             pass
         self.status("Fermo", "info")
+
+    def _release_held(self, force=False):
+        now = time.time()
+        due = [h for h in self.held if force or h[0] <= now]
+        self.held = [h for h in self.held if not (force or h[0] <= now)]
+        for _, _, rec, proto, ip in due:
+            self.on_qso(rec, self.cfg["name"], proto, ip)
 
     def stop(self):
         self.stop_event.set()
@@ -1152,7 +1176,7 @@ def run_gui():
     b_import.pack(side="left", padx=(6, 0))
     b_save = ttk.Button(bar, text="Salva impostazioni")
     b_save.pack(side="left", padx=6)
-    b_folder = ttk.Button(bar, text="Apri cartella")
+    b_folder = ttk.Button(bar, text="Apri cartella dati")
     b_folder.pack(side="left")
     v_counters = tk.StringVar()
     ttk.Label(bar, textvariable=v_counters, font=("Segoe UI", 10, "bold")).pack(side="right")
@@ -1161,7 +1185,7 @@ def run_gui():
     l_mode.pack(side="right", padx=12)
 
     # --- Log ---
-    logf = ttk.LabelFrame(root, text=" Messaggi ", padding=4)
+    logf = ttk.LabelFrame(root, text=" Messaggi  (Alt+W per cancellare) ", padding=4)
     logf.pack(fill="both", expand=True, padx=10, pady=(5, 10))
     txt = ScrolledText(logf, height=16, font=("Consolas", 9), state="disabled", wrap="word")
     txt.pack(fill="both", expand=True)
@@ -1177,6 +1201,15 @@ def run_gui():
             txt.delete("1.0", "%d.0" % (lines - 3000))
         txt.configure(state="disabled")
         txt.see("end")
+
+    def clear_log(event=None):
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        txt.configure(state="disabled")
+        return "break"
+
+    root.bind("<Alt-w>", clear_log)
+    root.bind("<Alt-W>", clear_log)  # con il blocco maiuscole attivo
 
     def collect():
         return {"callsign": v_call.get().strip().upper(), "email": v_email.get().strip(),

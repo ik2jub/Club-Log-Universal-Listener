@@ -17,7 +17,7 @@ batch catch-up uploads (putlogs.php), ADIF import filtered by station callsign, 
   - XML in formato N1MM `<contactinfo>` / `<contactreplace>`: QARTest e DXLog;
   - testo ADIF semplice (es. "secondary UDP server" di WSJT-X/JTDX).
 - **Messaggi di stato a video**: ultimo pacchetto ricevuto per ogni porta (anche gli heartbeat), QSO
-  ricevuti, conferme e errori di Club Log, contatori.
+  ricevuti, conferme e errori di Club Log, contatori. **Alt+W** cancella l'area messaggi.
 - **Nessun QSO perso**: la coda dei QSO non ancora inviati è salvata su disco a ogni modifica e
   sopravvive a crash, mancanza di corrente e assenza di internet.
 - **Rispetto delle regole di Club Log**: pausa minima configurabile tra due invii, invio a blocchi con
@@ -95,6 +95,19 @@ Note:
   usa un indirizzo multicast.
 - Le cancellazioni di QSO inviate da DXLog/QARTest vengono segnalate nel log ma vanno fatte a mano su
   Club Log.
+
+## Prova senza i programmi
+
+`simula_pacchetti.py` invia al listener gli stessi pacchetti UDP dei cinque programmi (heartbeat e QSO di
+esempio). Avvia il listener in modalità TEST, poi:
+
+```
+python simula_pacchetti.py                       tutti e 5 i programmi
+python simula_pacchetti.py JTDX QARTest          solo alcuni
+python simula_pacchetti.py --host 192.168.1.10   listener su un altro PC
+```
+
+I QSO di prova finiscono anche in `qso_ricevuti.adi`: cancellalo dopo le prove.
 
 ## File creati dal programma
 
