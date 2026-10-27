@@ -26,6 +26,9 @@ batch catch-up uploads (putlogs.php), ADIF import filtered by station callsign, 
 - **Importazione di un log ADIF pregresso**: carica solo i QSO con `STATION_CALLSIGN` uguale al nominativo
   impostato, con filtro facoltativo per date. I QSO vengono **uniti** al log esistente (nessuna
   cancellazione).
+- **Controllo del nominativo**: i QSO ricevuti con `STATION_CALLSIGN` diverso dal nominativo DX
+  impostato vengono scartati e segnalati in rosso nei messaggi (i QSO senza `STATION_CALLSIGN` sono
+  accettati).
 - **Doppioni**: WSJT-X e JTDX inviano ogni QSO in due formati; ne viene caricato uno solo.
 - **Modalità TEST**: riceve e mostra i QSO senza inviarli, per verificare la configurazione.
 - **Icona nella tray bar** con colore di stato (verde online, arancione test, rosso errore) e notifiche

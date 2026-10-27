@@ -960,6 +960,12 @@ class Engine:
             self.stats["errors"] += 1
             self.emit(("log", "err", "[%s] QSO scartato (%s): %s" % (program, err, raw)))
             return
+        station = rec.get("station_callsign", "")
+        if station and self.callsign and station != self.callsign:
+            self.stats["errors"] += 1
+            self.emit(("log", "err", "[%s] QSO scartato: STATION_CALLSIGN %s diverso dal nominativo DX %s - %s"
+                       % (program, station, self.callsign, describe(rec))))
+            return
         key = "|".join((rec["call"], rec["qso_date"], rec["time_on"][:4], rec["band"],
                         rec.get("submode") or rec["mode"]))
         now = time.time()
@@ -981,11 +987,6 @@ class Engine:
 
         desc = describe(rec)
         self.emit(("log", "rx", "[%s] QSO ricevuto da %s (%s): %s" % (program, sender, proto, desc)))
-        station = rec.get("station_callsign", "")
-        if station and self.callsign and station != self.callsign:
-            self.emit(("log", "warn", "[%s] attenzione: STATION_CALLSIGN %s diverso dal nominativo "
-                       "DX %s - il QSO va comunque nel log di %s" % (program, station, self.callsign,
-                                                                    self.callsign)))
         if self.dry_run:
             self.emit(("log", "ok", "[%s] TEST, non inviato a Club Log: %s" % (program, desc)))
             self.emit(("log", "info", "        ADIF: %s" % adif))
