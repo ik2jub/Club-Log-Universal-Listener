@@ -422,6 +422,8 @@ namespace ClubLogListener
             return n;
         }
 
+        const string StatusSample = "00:00:00  ultimo: N1MM-XML contactinfo (QARTest) da 192.168.100.200";
+
         Control BuildPorts()
         {
             var t = new TableLayoutPanel();
@@ -441,6 +443,8 @@ namespace ClubLogListener
             }
 
             var ipChoices = LocalIpv4Addresses().ToArray();
+            // Colonna Stato larga quanto il messaggio più lungo tra quelli comuni
+            int statusWidth = TextRenderer.MeasureText(StatusSample, Font).Width + Ui.S(8);
             for (int i = 0; i < cfg.Listeners.Count; i++)
             {
                 var lc = cfg.Listeners[i];
@@ -453,17 +457,17 @@ namespace ClubLogListener
                 r.Ip = new ComboBox();
                 r.Ip.Items.AddRange(ipChoices);
                 r.Ip.Text = lc.Ip;
-                r.Ip.Width = Ui.S(140);
-                r.Port = Box(lc.Port, 60);
-                r.Mcast = Box(lc.Mcast, 110);
+                r.Ip.Width = Ui.S(118);
+                r.Port = Box(lc.Port, 48);
+                r.Mcast = Box(lc.Mcast, 100);
                 r.Status = new Label();
                 r.Status.Text = "Fermo";
                 r.Status.ForeColor = Colors["info"];
                 r.Status.Dock = DockStyle.Fill;
                 r.Status.TextAlign = ContentAlignment.MiddleLeft;
                 r.Status.AutoEllipsis = true;
+                r.Status.MinimumSize = new Size(statusWidth, 0);
                 var name = Lbl(lc.Name);
-                name.MinimumSize = new Size(Ui.S(75), 0);
                 t.Controls.Add(r.Enabled, 0, i + 1);
                 t.Controls.Add(name, 1, i + 1);
                 t.Controls.Add(r.Ip, 2, i + 1);

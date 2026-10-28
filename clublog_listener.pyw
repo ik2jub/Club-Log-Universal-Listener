@@ -1608,7 +1608,11 @@ def run_gui():
     # --- Porte UDP in ascolto ---
     for col, title in enumerate(["Attivo", "Programma", "Interfaccia (IP)", "Porta", "Multicast (opz.)", "Stato"]):
         ttk.Label(lf, text=title, font=("Segoe UI", 9, "bold")).grid(row=0, column=col, sticky="w", padx=4)
-    lf.columnconfigure(5, weight=1)
+    # Colonna Stato larga quanto il messaggio più lungo tra quelli comuni
+    from tkinter import font as tkfont
+    status_px = tkfont.nametofont("TkDefaultFont").measure(
+        "00:00:00  ultimo: N1MM-XML contactinfo (QARTest) da 192.168.100.200") + 16
+    lf.columnconfigure(5, weight=1, minsize=status_px)
 
     ip_choices = local_ipv4_addresses()
     rows = []
@@ -1620,15 +1624,15 @@ def run_gui():
              "mcast": tk.StringVar(value=lcfg["mcast"])}
         r["w_en"] = ttk.Checkbutton(lf, variable=r["enabled"])
         r["w_en"].grid(row=i + 1, column=0, padx=4, pady=2)
-        ttk.Label(lf, text=lcfg["name"], width=10).grid(row=i + 1, column=1, sticky="w", padx=4)
-        r["w_ip"] = ttk.Combobox(lf, textvariable=r["ip"], values=ip_choices, width=16)
-        r["w_ip"].grid(row=i + 1, column=2, padx=4)
-        r["w_port"] = ttk.Entry(lf, textvariable=r["port"], width=7)
-        r["w_port"].grid(row=i + 1, column=3, padx=4)
+        ttk.Label(lf, text=lcfg["name"]).grid(row=i + 1, column=1, sticky="w", padx=4)
+        r["w_ip"] = ttk.Combobox(lf, textvariable=r["ip"], values=ip_choices, width=14)
+        r["w_ip"].grid(row=i + 1, column=2, sticky="w", padx=4)
+        r["w_port"] = ttk.Entry(lf, textvariable=r["port"], width=6)
+        r["w_port"].grid(row=i + 1, column=3, sticky="w", padx=4)
         r["w_mcast"] = ttk.Entry(lf, textvariable=r["mcast"], width=14)
-        r["w_mcast"].grid(row=i + 1, column=4, padx=4)
-        # width fissa: un testo di stato lungo non deve allargare la finestra
-        r["status"] = tk.Label(lf, text="Fermo", anchor="w", fg=COLORS["info"], width=24)
+        r["w_mcast"].grid(row=i + 1, column=4, sticky="w", padx=4)
+        # width=1: la larghezza la dà la colonna; un testo più lungo non allarga la finestra
+        r["status"] = tk.Label(lf, text="Fermo", anchor="w", fg=COLORS["info"], width=1)
         r["status"].grid(row=i + 1, column=5, sticky="we", padx=4)
         rows.append(r)
 
