@@ -175,6 +175,29 @@ namespace ClubLogListener
             return sb.Append("<EOR>").ToString();
         }
 
+        // Usa la fine del QSO come data/ora del QSO, se c'è TIME_OFF. Senza QSO_DATE_OFF, una fine
+        // prima dell'inizio vuol dire che il QSO è passato a cavallo della mezzanotte UTC: la data di
+        // fine è il giorno dopo l'inizio.
+        static void UseEndTime(Dictionary<string, string> r)
+        {
+            string tOff = Util.Get(r, "time_off");
+            if (tOff.Length < 4)
+                return;
+            string dateOff = Util.Get(r, "qso_date_off");
+            if (dateOff.Length != 8)
+            {
+                string tOn = Util.Get(r, "time_on");
+                DateTime day;
+                if (!DateTime.TryParseExact(Util.Get(r, "qso_date"), "yyyyMMdd", Inv, DateTimeStyles.None, out day))
+                    return;
+                if (tOn.Length >= 4 && string.CompareOrdinal(tOff.PadRight(6, '0'), tOn.PadRight(6, '0')) < 0)
+                    day = day.AddDays(1);
+                dateOff = day.ToString("yyyyMMdd", Inv);
+            }
+            r["qso_date"] = r["qso_date_off"] = dateOff;
+            r["time_on"] = tOff;
+        }
+
         // Pulisce un record per Club Log. Restituisce null e l'errore se il QSO non è valido.
         public static Dictionary<string, string> Normalize(Dictionary<string, string> rec, bool includeFreq, out string error)
         {
@@ -196,6 +219,7 @@ namespace ClubLogListener
             foreach (string key in new[] { "time_on", "time_off" })
                 if (r.ContainsKey(key))
                     r[key] = Util.Slice(NonDigit.Replace(r[key], ""), 0, 6);
+            UseEndTime(r);
 
             double freq = 0;
             bool hasFreq = Util.Get(r, "freq").Length > 0 && TryFloat(r["freq"], out freq);

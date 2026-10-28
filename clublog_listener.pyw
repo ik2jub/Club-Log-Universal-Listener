@@ -316,6 +316,28 @@ def build_adif(record):
     return "".join(parts) + "<EOR>"
 
 
+def use_end_time(r):
+    """Usa la fine del QSO come data/ora del QSO, se c'è TIME_OFF.
+
+    Senza QSO_DATE_OFF, una fine prima dell'inizio vuol dire che il QSO è passato
+    a cavallo della mezzanotte UTC: la data di fine è il giorno dopo l'inizio."""
+    t_off = r.get("time_off", "")
+    if len(t_off) < 4:
+        return
+    date_off = r.get("qso_date_off", "")
+    if len(date_off) != 8:
+        date_on, t_on = r.get("qso_date", ""), r.get("time_on", "")
+        try:
+            day = dt.datetime.strptime(date_on, "%Y%m%d")
+        except ValueError:
+            return
+        if len(t_on) >= 4 and t_off.ljust(6, "0") < t_on.ljust(6, "0"):
+            day += dt.timedelta(days=1)
+        date_off = day.strftime("%Y%m%d")
+    r["qso_date"] = r["qso_date_off"] = date_off
+    r["time_on"] = t_off
+
+
 def normalize_record(rec, include_freq):
     """Pulisce un record per Club Log. Restituisce (record, errore)."""
     r = {k.lower(): str(v).strip() for k, v in rec.items() if v is not None and str(v).strip()}
@@ -330,6 +352,7 @@ def normalize_record(rec, include_freq):
     for key in ("time_on", "time_off"):
         if key in r:
             r[key] = re.sub(r"\D", "", r[key])[:6]
+    use_end_time(r)
 
     freq = None
     if r.get("freq"):

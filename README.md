@@ -48,6 +48,10 @@ batch catch-up uploads (putlogs.php), ADIF import filtered by station callsign, 
 - **Controllo del nominativo**: i QSO ricevuti con `STATION_CALLSIGN` diverso dal nominativo DX
   impostato vengono scartati e segnalati in rosso nei messaggi (i QSO senza `STATION_CALLSIGN` sono
   accettati).
+- **Orario di fine QSO**: se il QSO ha sia l'inizio sia la fine (`TIME_ON` e `TIME_OFF`, come in
+  WSJT-X, JTDX e MSHV), a Club Log vengono inviate la data e l'ora di **fine**, anche per i log
+  importati. Per i QSO a cavallo della mezzanotte UTC vale la data di fine (`QSO_DATE_OFF`); se manca, è
+  il giorno dopo l'inizio quando l'ora di fine è minore di quella di inizio.
 - **Doppioni**: WSJT-X e JTDX inviano ogni QSO in due formati; ne viene caricato uno solo.
 - **Modalità TEST**: riceve e mostra i QSO senza inviarli, per verificare la configurazione.
 - **Icona nella tray bar** con colore di stato (verde online, arancione test, rosso errore) e notifiche
