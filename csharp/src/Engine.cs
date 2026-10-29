@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace ClubLogListener
@@ -277,25 +278,19 @@ namespace ClubLogListener
         }
 
         // Chiavi dei QSO già ricevuti, dalla copia qso_ricevuti.adi
-        static HashSet<string> ReceivedKeys()
+        // Chiavi dei QSO già ricevuti (qso_ricevuti.adi) o cancellati a mano da Club Log
+        // (qso_cancellati.adi): il recupero dai log dei programmi non li rimanda
+        internal static HashSet<string> ReceivedKeys()
         {
             var keys = new HashSet<string>();
-            byte[] data;
-            try
-            {
-                data = File.ReadAllBytes(App.BackupAdif);
-            }
-            catch (Exception)
-            {
-                return keys;
-            }
-            foreach (var raw in Adif.Parse(data))
-            {
-                string err;
-                var rec = Adif.Normalize(raw, true, out err);
-                if (rec != null)
-                    keys.Add(LogProgrammi.Key(rec));
-            }
+            foreach (string path in new[] { App.BackupAdif, App.DeletedAdif })
+                foreach (var raw in Manuale.ReadAdifFile(path))
+                {
+                    string err;
+                    var rec = Adif.Normalize(raw, true, out err);
+                    if (rec != null)
+                        keys.Add(LogProgrammi.Key(rec));
+                }
             return keys;
         }
 
@@ -348,14 +343,7 @@ namespace ClubLogListener
                 seen[key] = now;
                 Interlocked.Increment(ref Stats.Received);
                 adif = Adif.Build(rec);
-                try
-                {
-                    Util.AppendText(App.BackupAdif, "QSO ricevuti da " + App.Name + "\r\n<ADIF_VER:5>3.1.4<EOH>\r\n", adif + "\r\n");
-                }
-                catch (Exception e)
-                {
-                    emit(UiEvent.Log("warn", "impossibile scrivere il backup ADIF: " + e.Message));
-                }
+                Backup(adif);
             }
 
             string desc = Adif.Describe(rec);
@@ -367,6 +355,216 @@ namespace ClubLogListener
                 return;
             }
             Uploader.Add(adif, desc, program);
+        }
+
+        void Backup(string adif)
+        {
+            try
+            {
+                Util.AppendText(App.BackupAdif, "QSO ricevuti da " + App.Name + "\r\n<ADIF_VER:5>3.1.4<EOH>\r\n", adif + "\r\n");
+            }
+            catch (Exception e)
+            {
+                emit(UiEvent.Log("warn", "impossibile scrivere il backup ADIF: " + e.Message));
+            }
+        }
+
+        // QSO inserito a mano: come uno ricevuto, senza il controllo dei doppioni ravvicinati
+        // (lo fa la finestra, chiedendo conferma). Restituisce l'errore o null.
+        public string AddManual(Dictionary<string, string> input, Settings s)
+        {
+            var raw = new Dictionary<string, string>(input);
+            raw["station_callsign"] = s.Callsign;
+            string err;
+            var rec = Adif.Normalize(raw, true, out err);
+            if (rec == null)
+                return err;
+            string adif = Adif.Build(rec);
+            lock (sync)
+            {
+                seen[LogProgrammi.Key(rec)] = Util.Now();  // se arriva anche via UDP è un doppione
+                Interlocked.Increment(ref Stats.Received);
+                Backup(adif);
+            }
+            string desc = Adif.Describe(rec);
+            emit(UiEvent.Log("rx", string.Format("[{0}] QSO inserito a mano: {1}", Manuale.Source, desc)));
+            if (s.DryRun)
+            {
+                emit(UiEvent.Log("ok", string.Format("[{0}] TEST, non inviato a Club Log: {1}", Manuale.Source, desc)));
+                emit(UiEvent.Log("info", "        ADIF: " + adif));
+                return null;
+            }
+            Uploader.Add(adif, desc, Manuale.Source);
+            if (!Running)
+                emit(UiEvent.Log("warn", string.Format("[{0}] il QSO verrà inviato a Club Log appena avvii l'ascolto: {1}",
+                    Manuale.Source, desc)));
+            return null;
+        }
+
+        // Cancella da Club Log un QSO di qso_ricevuti.adi, o lo toglie dalla coda se non è ancora partito.
+        // Esito: "coda", "cancellato", "test", "non trovato", "errore". Va chiamata fuori dalla GUI:
+        // aspetta la risposta di Club Log.
+        public string DeleteQso(Dictionary<string, string> rec, Settings s, out string msg)
+        {
+            string desc = Adif.Describe(rec);
+            int removed = Uploader.Remove(Manuale.StoredKey(rec));
+            if (removed < 0)
+            {
+                msg = string.Format("Il QSO {0} è in invio proprio ora: riprova tra qualche secondo.", desc);
+                return "errore";
+            }
+            if (removed > 0)
+            {
+                MarkDeleted(rec);
+                msg = "QSO tolto dalla coda prima dell'invio: " + desc;
+                emit(UiEvent.Log("ok", string.Format("[{0}] {1}", Manuale.Source, msg)));
+                return "coda";
+            }
+            if (s.DryRun)
+            {
+                msg = "TEST, non cancellato da Club Log: " + desc;
+                emit(UiEvent.Log("ok", string.Format("[{0}] {1}", Manuale.Source, msg)));
+                return "test";
+            }
+            string bandId;
+            if (!Manuale.DeleteBandIds.TryGetValue(Util.Get(rec, "band").Trim().ToLowerInvariant(), out bandId))
+            {
+                msg = string.Format("Club Log non permette di cancellare con le API i QSO in banda {0}: " +
+                    "cancella {1} dal sito di Club Log (Log Inspector).", Util.Get(rec, "band"), desc);
+                return "errore";
+            }
+            string when = Manuale.DeleteDatetime(rec);
+            // Club Log vuole data e ora esatte; se ha registrato l'ora senza i secondi va bene anche :00
+            var attempts = new List<string> { when };
+            if (!when.EndsWith(":00", StringComparison.Ordinal))
+                attempts.Add(when.Substring(0, when.Length - 2) + "00");
+            foreach (string attempt in attempts)
+            {
+                int code;
+                string text;
+                try
+                {
+                    code = Uploader.Delete(Util.Get(rec, "call").Trim(), attempt, bandId, s, out text);
+                }
+                catch (Exception e)  // rete assente, timeout, SSL...
+                {
+                    msg = string.Format("Cancellazione non riuscita, rete non disponibile ({0}): {1}", e.Message, desc);
+                    emit(UiEvent.Log("err", string.Format("[{0}] {1}", Manuale.Source, msg)));
+                    return "errore";
+                }
+                string shortText = Util.Slice(text.Replace("\r", " ").Replace("\n", " "), 0, 160);
+                if (code != 200)
+                {
+                    msg = string.Format("Club Log non ha cancellato {0} (HTTP {1}: {2})", desc, code, shortText);
+                    emit(UiEvent.Log("err", string.Format("[{0}] {1}", Manuale.Source, msg)));
+                    return "errore";
+                }
+                if (!Regex.IsMatch(text, @"not\s*deleted", RegexOptions.IgnoreCase))
+                {
+                    MarkDeleted(rec);
+                    msg = string.Format("Cancellato da Club Log: {0} ({1} UTC)  [{2}]", desc, attempt, shortText);
+                    emit(UiEvent.Log("ok", string.Format("[{0}] {1}", Manuale.Source, msg)));
+                    return "cancellato";
+                }
+            }
+            msg = string.Format("Club Log non ha trovato il QSO {0} ({1} UTC): nessuna cancellazione", desc, when);
+            emit(UiEvent.Log("warn", string.Format("[{0}] {1}", Manuale.Source, msg)));
+            return "non trovato";
+        }
+
+        // Scarica tutto il log da Club Log (getadif.php) in log_clublog.adi. Esito "ok" o "errore".
+        // Va chiamata fuori dalla GUI: aspetta la risposta di Club Log.
+        public string DownloadClubLogLog(Settings s, out string msg)
+        {
+            if (File.Exists(App.ClubLogAdif))
+            {
+                double age = (DateTime.UtcNow - File.GetLastWriteTimeUtc(App.ClubLogAdif)).TotalSeconds;
+                if (age >= 0 && age < App.DownloadMinIntervalS)
+                {
+                    msg = string.Format("Il log è stato scaricato {0} secondi fa: per non caricare Club Log con richieste " +
+                        "ravvicinate si può riscaricarlo tra {1} secondi.", (int)age, App.DownloadMinIntervalS - (int)age);
+                    return "errore";
+                }
+            }
+            int code;
+            string text;
+            try
+            {
+                code = Uploader.GetAdif(s, out text);
+            }
+            catch (Exception e)  // rete assente, timeout, SSL...
+            {
+                msg = string.Format("Download non riuscito, rete non disponibile ({0})", e.Message);
+                return "errore";
+            }
+            string shortText = Util.Slice(text.Replace("\r", " ").Replace("\n", " "), 0, 160);
+            if (code != 200)
+            {
+                msg = string.Format("Club Log non ha dato il log (HTTP {0}: {1})", code, shortText);
+                emit(UiEvent.Log("err", string.Format("[{0}] {1}", Manuale.Source, msg)));
+                return "errore";
+            }
+            if (!Regex.IsMatch(text, "<eoh>|<eor>", RegexOptions.IgnoreCase))
+            {
+                msg = "Club Log non ha risposto con un log ADIF: " + shortText;
+                return "errore";
+            }
+            int count = Adif.Parse(text).Count;
+            try
+            {
+                Util.WriteAtomic(App.ClubLogAdif, text, App.ClubLogAdif + ".tmp");
+            }
+            catch (Exception e)
+            {
+                msg = string.Format("Impossibile salvare {0}: {1}", Path.GetFileName(App.ClubLogAdif), e.Message);
+                return "errore";
+            }
+            msg = string.Format("Scaricato da Club Log il log di {0}: {1} QSO", s.Callsign, count);
+            emit(UiEvent.Log("ok", string.Format("[{0}] {1}", Manuale.Source, msg)));
+            return "ok";
+        }
+
+        // Aggiunge il QSO inserito a mano (già normalizzato) ai log scelti: etichetta e percorso
+        // (vuoto = file per MSHV). Restituisce le righe di esito per la finestra.
+        public List<string> AddToProgramLogs(Dictionary<string, string> rec, List<KeyValuePair<string, string>> targets)
+        {
+            var lines = new List<string>();
+            foreach (var t in targets)
+            {
+                string msg, level = "ok";
+                try
+                {
+                    if (t.Value.Length > 0)
+                    {
+                        Manuale.AppendToWsjtxLog(t.Value, rec);
+                        msg = "aggiunto a " + t.Value + " (si vede come già collegato dopo il riavvio del programma)";
+                    }
+                    else
+                        msg = "file da importare in MSHV: " + Manuale.WriteMshvImport(rec);
+                }
+                catch (Exception e)
+                {
+                    msg = string.Format("NON aggiunto a {0}: {1}", t.Value.Length > 0 ? t.Value : "MSHV", e.Message);
+                    level = "err";
+                }
+                emit(UiEvent.Log(level, string.Format("[{0}] {1} {2}", Manuale.Source, t.Key, msg)));
+                lines.Add(t.Key + ": " + msg);
+            }
+            return lines;
+        }
+
+        // Il QSO resta in qso_ricevuti.adi: così il recupero dai log dei programmi non lo rimanda
+        void MarkDeleted(Dictionary<string, string> rec)
+        {
+            try
+            {
+                Util.AppendText(App.DeletedAdif, "QSO cancellati da Club Log con " + App.Name + "\r\n<ADIF_VER:5>3.1.4<EOH>\r\n",
+                                Adif.Build(rec) + "\r\n");
+            }
+            catch (Exception e)
+            {
+                emit(UiEvent.Log("warn", string.Format("impossibile scrivere {0}: {1}", Path.GetFileName(App.DeletedAdif), e.Message)));
+            }
         }
     }
 }

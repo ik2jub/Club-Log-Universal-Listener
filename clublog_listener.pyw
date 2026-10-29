@@ -21,6 +21,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import socket
 import struct
 import sys
@@ -46,6 +47,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "clublog_listener.json")
 QUEUE_FILE = os.path.join(BASE_DIR, "clublog_listener_coda.json")
 BACKUP_ADIF = os.path.join(BASE_DIR, "qso_ricevuti.adi")
 REJECTED_ADIF = os.path.join(BASE_DIR, "qso_rifiutati.adi")
+DELETED_ADIF = os.path.join(BASE_DIR, "qso_cancellati.adi")
 # File ADIF importati: restano qui finché Club Log non li accetta, poi vengono spostati
 JOBS_DIR = os.path.join(BASE_DIR, "caricamenti_in_attesa")
 JOBS_DONE_DIR = os.path.join(BASE_DIR, "caricamenti_inviati")
@@ -68,6 +70,7 @@ HOLD_QSO_LOGGED_S = 3  # attesa del Logged ADIF dopo un QSO Logged di WSJT-X/JTD
 ALIVE_EVERY_S = 60     # ogni quanto si salva l'ultimo momento in ascolto (copre spegnimenti e crash)
 GAP_MARGIN_S = 300     # margine prima dell'ultimo momento in ascolto: i doppioni vengono scartati
 PUTLOGS_URL = "https://clublog.org/putlogs.php"
+DELETE_URL = "https://clublog.org/delete.php"
 # Club Log non pubblica limiti numerici: chiede un ritmo "normale" per realtime.php,
 # putlogs.php per gli arretrati e nessun invio a blocchi ripetuto e ravvicinato.
 DEFAULT_INTERVAL_S = 5        # pausa minima tra due QSO inviati con realtime.php
@@ -400,6 +403,215 @@ def describe(rec):
 
 
 # --------------------------------------------------------------------------
+# QSO inseriti a mano e cancellazioni da Club Log
+# --------------------------------------------------------------------------
+
+MANUAL_SOURCE = "Manuale"
+MANUAL_MODES = ["FT8", "FT4", "CW", "SSB", "USB", "LSB", "RTTY", "PSK31", "JT65", "JT9", "Q65",
+                "MSK144", "FST4", "JS8", "FM", "AM", "SSTV"]
+# Bande che delete.php accetta (bandid); per le altre il QSO va cancellato dal sito
+DELETE_BAND_IDS = {"160m": "160", "80m": "80", "60m": "60", "40m": "40", "30m": "30", "20m": "20",
+                   "17m": "17", "15m": "15", "12m": "12", "10m": "10", "6m": "6", "4m": "4",
+                   "2m": "2", "70cm": "70", "23cm": "23", "13cm": "13"}
+QSO_STATUS_SENT = "ricevuto"
+QSO_STATUS_QUEUED = "in coda"
+QSO_STATUS_DELETED = "cancellato"
+QSO_STATUS_REJECTED = "rifiutato"
+QSO_STATUS_CLUBLOG = "su Club Log"  # dal log scaricato, non passato dal listener
+# Log intero scaricato da Club Log, per cercare anche i QSO caricati in altro modo
+CLUBLOG_ADIF = os.path.join(BASE_DIR, "log_clublog.adi")
+GETADIF_URL = "https://clublog.org/getadif.php"
+DOWNLOAD_MIN_INTERVAL_S = 300  # tra due download del log intero: niente richieste ravvicinate
+# Copia di wsjtx_log.adi prima di aggiungere un QSO; file ADIF da importare in MSHV
+PROGRAM_LOG_COPIES_DIR = os.path.join(BASE_DIR, "copie_log_programmi")
+MSHV_IMPORT_DIR = os.path.join(BASE_DIR, "da_importare_in_MSHV")
+MSHV_IMPORT_NOTE = ("In MSHV apri la finestra del log, usa \"Add ADIF To Log\" e scegli il file indicato, una volta "
+                    "sola: MSHV non controlla i doppioni. Non inserire il QSO a mano in MSHV: lo trasmetterebbe "
+                    "via UDP (e a Club Log, se attivo) e arriverebbe due volte. L'importazione invece non trasmette "
+                    "niente.")
+MSHV_FIX_NOTE = ("Se il QSO vecchio è anche nel log di MSHV, cancellalo lì: nella finestra del log selezionalo e premi "
+                 "DELETE SELECTED. In alternativa correggilo direttamente con EDIT QSO, senza importare il file. "
+                 "In mshvlog.adi il QSO vecchio resta (MSHV non riscrive quel file), ma il listener non lo rimanda.")
+PROGRAM_FIELDS = ["call", "mode", "submode", "rst_sent", "rst_rcvd", "qso_date", "time_on",
+                  "qso_date_off", "time_off", "band", "station_callsign"]
+
+
+def default_rst(mode):
+    mode = mode.upper()
+    if mode in ("CW", "RTTY", "PSK31", "PSK63"):
+        return "599"
+    if mode in ("SSB", "USB", "LSB", "FM", "AM", "SSTV"):
+        return "59"
+    return "-10"
+
+
+def lower_keys(rec):
+    return {k.lower(): str(v).strip() for k, v in rec.items()}
+
+
+def stored_key(rec):
+    """Chiave di un QSO così come è stato inviato a Club Log: data e ora al secondo, senza normalizzare."""
+    r = lower_keys(rec)
+    return "|".join((r.get("call", "").upper(), r.get("qso_date", ""), r.get("time_on", "").ljust(6, "0")[:6],
+                     r.get("band", "").lower(), (r.get("submode") or r.get("mode", "")).upper()))
+
+
+def stored_timestamp(rec):
+    try:
+        return dt.datetime.strptime(rec.get("qso_date", "") + rec.get("time_on", "").ljust(6, "0")[:6],
+                                    "%Y%m%d%H%M%S").replace(tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def delete_datetime(rec):
+    """Data e ora nel formato di delete.php: AAAA-MM-GG HH:MM:SS."""
+    d, t = rec.get("qso_date", ""), rec.get("time_on", "").ljust(6, "0")
+    return "%s-%s-%s %s:%s:%s" % (d[0:4], d[4:6], d[6:8], t[0:2], t[2:4], t[4:6])
+
+
+def parse_utc_input(date_text, time_text):
+    """Data (AAAA-MM-GG) e ora (HH:MM o HH:MM:SS) scritte a mano. ValueError con il motivo."""
+    d = re.sub(r"\D", "", date_text)
+    t = re.sub(r"\D", "", time_text)
+    if len(d) != 8:
+        raise ValueError("Data non valida: usa il formato AAAA-MM-GG.")
+    if len(t) not in (4, 6):
+        raise ValueError("Ora non valida: usa il formato HH:MM o HH:MM:SS.")
+    try:
+        return dt.datetime.strptime(d + t.ljust(6, "0"), "%Y%m%d%H%M%S")
+    except ValueError:
+        raise ValueError("Data o ora inesistente.")
+
+
+def read_adif_file(path):
+    try:
+        with open(path, "rb") as f:
+            return [lower_keys(r) for r in parse_adif(f.read())]
+    except OSError:
+        return []
+
+
+def append_adif(path, adif, title):
+    with open(path, "a", encoding="utf-8") as f:
+        if f.tell() == 0:
+            f.write("%s\n<ADIF_VER:5>3.1.4<EOH>\n" % title)
+        f.write(adif + "\n")
+
+
+def minute_key(rec):
+    """Stesso QSO in qso_ricevuti.adi e nel log scaricato da Club Log (che può scrivere il modo diversamente)."""
+    return "|".join((rec.get("call", "").upper(), rec.get("qso_date", ""), rec.get("time_on", "")[:4],
+                     rec.get("band", "").lower()))
+
+
+def received_qsos(queued_keys):
+    """QSO di qso_ricevuti.adi come sono stati inviati a Club Log, in ordine di arrivo, con lo stato,
+    seguiti dai QSO del log scaricato da Club Log che non sono passati dal listener.
+
+    Un QSO cancellato o rifiutato più volte compare più volte nel file: ogni riga di
+    qso_cancellati.adi / qso_rifiutati.adi vale per la ricezione più vecchia, la coda per le più recenti."""
+    recs = read_adif_file(BACKUP_ADIF)
+    status = [QSO_STATUS_SENT] * len(recs)
+    known = {minute_key(r) for r in recs}
+    for r in read_adif_file(CLUBLOG_ADIF):
+        if minute_key(r) not in known:
+            recs.append(r)
+            status.append(QSO_STATUS_CLUBLOG)
+    keys = [stored_key(r) for r in recs]
+    for path, label, newest_first, applies in (
+            (DELETED_ADIF, QSO_STATUS_DELETED, False, (QSO_STATUS_SENT, QSO_STATUS_CLUBLOG)),
+            (REJECTED_ADIF, QSO_STATUS_REJECTED, False, (QSO_STATUS_SENT,)),
+            (None, QSO_STATUS_QUEUED, True, (QSO_STATUS_SENT,))):
+        left = {}
+        for k in (queued_keys if path is None else [stored_key(r) for r in read_adif_file(path)]):
+            left[k] = left.get(k, 0) + 1
+        order = range(len(recs) - 1, -1, -1) if newest_first else range(len(recs))
+        for i in order:
+            if status[i] in applies and left.get(keys[i]):
+                status[i] = label
+                left[keys[i]] -= 1
+    return list(zip(recs, status))
+
+
+def program_log_targets():
+    """Dove si può aggiungere un QSO inserito a mano: [(etichetta, percorso di wsjtx_log.adi)];
+    percorso vuoto = file ADIF da importare in MSHV."""
+    out = []
+    for program in ("WSJT-X", "JTDX"):
+        for path, _ in find_program_logs(program):
+            out.append((os.path.basename(os.path.dirname(path)), path))  # es. "WSJT-X - IC7300"
+    if mshv_dirs():
+        out.append(("MSHV (file da importare)", ""))
+    return out
+
+
+def _program_record(rec):
+    # Per i programmi la fine del QSO è uguale all'inizio
+    return dict(rec, qso_date_off=rec.get("qso_date", ""), time_off=rec.get("time_on", ""))
+
+
+def _adif_field(key, value):
+    return "<%s:%d>%s" % (key, len(value.encode("utf-8")), value)
+
+
+def append_to_wsjtx_log(path, rec):
+    """Aggiunge il QSO in fondo a wsjtx_log.adi (WSJT-X o JTDX), nel loro formato, dopo averne salvato
+    una copia. WSJT-X e JTDX scrivono il log solo aggiungendo in fondo, come qui."""
+    r = _program_record(rec)
+    line = " ".join(_adif_field(k, r[k]) for k in PROGRAM_FIELDS if r.get(k)) + " <eor>"
+    os.makedirs(PROGRAM_LOG_COPIES_DIR, exist_ok=True)
+    copy = os.path.join(PROGRAM_LOG_COPIES_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_",
+                                                      os.path.basename(os.path.dirname(path))) + "_wsjtx_log.adi")
+    shutil.copyfile(path, copy)
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        newline = True
+        if f.tell():
+            f.seek(-1, 2)
+            newline = f.read(1) == b"\n"
+    with open(path, "ab") as f:
+        f.write((("" if newline else "\r\n") + line + "\r\n").encode("utf-8"))
+    return copy
+
+
+def write_mshv_import(rec):
+    """File ADIF con il QSO, da aggiungere al log di MSHV con il suo comando "Add ADIF To Log".
+    ValueError se MSHV non gestisce il modo (HvLogW::AddExtrnalAdif lo scarterebbe)."""
+    r = _program_record(rec)
+    mode = (r.get("submode") or r.get("mode", "")).upper()  # MSHV usa FT4, Q65... come modi
+    if mode in SSB_SUBMODES:
+        mode = "SSB"
+    if mode not in MSHV_IMPORT_MODES:
+        raise ValueError("MSHV non gestisce il modo %s, file non creato" % mode)
+    r["mode"] = mode
+    r.pop("submode", None)
+    r["band"] = r.get("band", "").upper()               # come in mshvlog.adi (es. 20M)
+    os.makedirs(MSHV_IMPORT_DIR, exist_ok=True)
+    path = os.path.join(MSHV_IMPORT_DIR, "%s_%s_%s.adi" % (r["qso_date"], r["time_on"][:4],
+                                                            re.sub(r"[^A-Za-z0-9]", "_", r["call"])))
+    text = "QSO da aggiungere al log di MSHV con Add ADIF To Log\r\n%s%s<EOH>\r\n%s<EOR>\r\n" % (
+        _adif_field("ADIF_VER", "3.1.0"), _adif_field("PROGRAMID", APP_NAME),
+        "".join(_adif_field(k.upper(), r[k]) for k in PROGRAM_FIELDS if r.get(k)))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    return path
+
+
+def nearby_qsos(entries, call, band, when_ts, exclude_key=None, window_s=3600):
+    """QSO non cancellati con lo stesso nominativo e la stessa banda entro un'ora."""
+    out = []
+    for rec, st in entries:
+        if st == QSO_STATUS_DELETED or rec.get("call", "").upper() != call or \
+                rec.get("band", "").lower() != band or stored_key(rec) == exclude_key:
+            continue
+        ts = stored_timestamp(rec)
+        if ts is not None and abs(ts - when_ts) <= window_s:
+            out.append(rec)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Protocollo WSJT-X (WSJT-X, JTDX, MSHV)
 # --------------------------------------------------------------------------
 
@@ -600,6 +812,10 @@ MSHV_MODES = {"0": "NON", "1": "SSB", "2": "CW", "6": "FM", "10": "JTMS", "11": 
               "12": "ISCAT-A", "13": "ISCAT-B", "14": "JT6M", "15": "FSK315", "17": "MSK144",
               "18": "JT65A", "19": "JT65B", "20": "JT65C", "21": "PI4", "22": "FT8", "23": "MSKMS",
               "24": "FT4", "25": "Q65A", "26": "Q65B", "27": "Q65C", "28": "Q65D", "29": "FT2"}
+
+
+# Modi che "Add ADIF To Log" di MSHV accetta: i suoi modi, più JT65, Q65 e ISCAT che converte da sé
+MSHV_IMPORT_MODES = (set(MSHV_MODES.values()) - {"NON"}) | {"JT65", "Q65", "ISCAT"}
 
 
 def mshv_dirs():
@@ -913,6 +1129,7 @@ class Uploader(threading.Thread):
         self.last_batch = 0.0
         self.batch_wait_logged = False
         self.job_state = {"attempts": 0}
+        self.in_flight = []  # QSO in invio in questo momento: non si possono togliere dalla coda
 
     def log(self, level, text):
         self.emit(("log", level, text))
@@ -965,6 +1182,38 @@ class Uploader(threading.Thread):
             self._save()
         self.wake.set()
 
+    def queued_keys(self):
+        with self.lock:
+            items = list(self.items)
+        keys = []
+        for item in items:
+            recs = parse_adif(item["adif"])
+            if recs:
+                keys.append(stored_key(recs[0]))
+        return keys
+
+    def remove(self, key):
+        """Toglie dalla coda il QSO con questa chiave: True se tolto, False se non è in coda,
+        None se è in invio proprio ora."""
+        with self.lock:
+            for item in self.items:
+                recs = parse_adif(item["adif"])
+                if recs and stored_key(recs[0]) == key:
+                    if any(item is i for i in self.in_flight):
+                        return None
+                    self.items = [i for i in self.items if i is not item]
+                    self._save()
+                    return True
+        return False
+
+    def delete(self, dxcall, when, band_id, creds):
+        """Cancella un QSO con delete.php. Restituisce (codice HTTP, testo)."""
+        body = urllib.parse.urlencode({
+            "email": creds.get("email", ""), "password": creds.get("password", ""),
+            "callsign": creds.get("callsign", ""), "dxcall": dxcall, "datetime": when,
+            "bandid": band_id, "api": creds.get("api", "")}).encode("ascii")
+        return self._http(DELETE_URL, body, "application/x-www-form-urlencoded", 20)
+
     def resume(self):
         self.paused = False
         self.next_try = 0.0
@@ -974,10 +1223,10 @@ class Uploader(threading.Thread):
         self.stop_event.set()
         self.wake.set()
 
-    def _drop_first(self):
+    def _drop(self, items):
+        # Per identità e non per posizione: nel frattempo un QSO può essere stato tolto dalla coda a mano
         with self.lock:
-            if self.items:
-                self.items.pop(0)
+            self.items = [i for i in self.items if not any(i is x for x in items)]
             self._save()
 
     def _http(self, url, body, content_type, timeout):
@@ -1044,24 +1293,28 @@ class Uploader(threading.Thread):
                 self.wake.clear()
                 continue
             batch_due = item is not None and 0 < self.batch_threshold <= pending
-            if jobs or batch_due:
-                wait = self.last_batch + BATCH_MIN_INTERVAL_S - now
-                if wait > 0:
-                    if item is not None and not batch_due:
-                        self._send_one(item)  # il tempo reale continua mentre il file aspetta
+            try:
+                if jobs or batch_due:
+                    wait = self.last_batch + BATCH_MIN_INTERVAL_S - now
+                    if wait > 0:
+                        if item is not None and not batch_due:
+                            self._send_one(item)  # il tempo reale continua mentre il file aspetta
+                            continue
+                        if not self.batch_wait_logged:
+                            self.log("info", "Prossimo invio a blocchi tra %d s "
+                                     "(Club Log non vuole invii a blocchi ravvicinati)." % wait)
+                            self.batch_wait_logged = True
+                        self.next_try = now + wait
                         continue
-                    if not self.batch_wait_logged:
-                        self.log("info", "Prossimo invio a blocchi tra %d s "
-                                 "(Club Log non vuole invii a blocchi ravvicinati)." % wait)
-                        self.batch_wait_logged = True
-                    self.next_try = now + wait
-                    continue
-                if jobs:
-                    self._send_job(os.path.join(JOBS_DIR, jobs[0]))
+                    if jobs:
+                        self._send_job(os.path.join(JOBS_DIR, jobs[0]))
+                    else:
+                        self._send_batch(item)
                 else:
-                    self._send_batch(item)
-            else:
-                self._send_one(item)
+                    self._send_one(item)
+            finally:
+                with self.lock:
+                    self.in_flight = []
 
     def _send_job(self, path):
         name = os.path.basename(path)
@@ -1100,6 +1353,7 @@ class Uploader(threading.Thread):
     def _send_batch(self, first):
         with self.lock:
             batch = list(self.items[:BATCH_MAX_QSO])
+            self.in_flight = batch
         adif_file = "Coda di %s\n<ADIF_VER:5>3.1.4<PROGRAMID:%d>%s<EOH>\n%s\n" % (
             APP_NAME, len(APP_NAME), APP_NAME, "\n".join(i["adif"] for i in batch))
         self.log("info", "Invio a blocchi di %d QSO in coda (putlogs.php)..." % len(batch))
@@ -1112,9 +1366,7 @@ class Uploader(threading.Thread):
         self.batch_wait_logged = False
         short = text.replace("\r", " ").replace("\n", " ")[:160]
         if code == 200:
-            with self.lock:
-                del self.items[:len(batch)]
-                self._save()
+            self._drop(batch)
             self.stats["sent"] += len(batch)
             self.log("ok", "Club Log ha accettato il blocco di %d QSO: li elabora entro circa un minuto "
                      "[%s]" % (len(batch), short))
@@ -1123,6 +1375,10 @@ class Uploader(threading.Thread):
             self._pause("Club Log ha rifiutato l'invio a blocchi (HTTP %d: %s)" % (code, short))
 
     def _send_one(self, item):
+        with self.lock:
+            if not any(item is i for i in self.items):
+                return  # tolto dalla coda a mano subito prima dell'invio
+            self.in_flight = [item]
         try:
             code, text = self._post(item["adif"])
         except Exception as e:  # rete assente, timeout, SSL... il thread non deve mai morire
@@ -1137,7 +1393,7 @@ class Uploader(threading.Thread):
                 self.log("warn", "Club Log ha accettato ma modificato %s: %s" % (item["desc"], short))
             else:
                 self.log("ok", "Club Log OK: %s  [%s]" % (item["desc"], short))
-            self._drop_first()
+            self._drop([item])
             self.next_try = time.time() + self.interval
         elif code == 403 or text.startswith("Login rejected"):
             self._pause("Club Log ha rifiutato le credenziali (HTTP %d: %s)" % (code, short))
@@ -1150,7 +1406,7 @@ class Uploader(threading.Thread):
                     f.write(item["adif"] + "\n")
             except OSError:
                 pass
-            self._drop_first()
+            self._drop([item])
             self.next_try = time.time() + self.interval
         elif code in RETRYABLE_HTTP:  # 500 (manutenzione) e simili: Club Log dice di riprovare più tardi
             self._retry_later(item, "Club Log ha risposto HTTP %d (%s)" % (code, short))
@@ -1270,17 +1526,14 @@ class Engine:
                                % (program, period, path)))
 
     def _received_keys(self):
-        """Chiavi dei QSO già ricevuti, dalla copia qso_ricevuti.adi."""
+        """Chiavi dei QSO già ricevuti (qso_ricevuti.adi) o cancellati a mano da Club Log
+        (qso_cancellati.adi): il recupero dai log dei programmi non li rimanda."""
         keys = set()
-        try:
-            with open(BACKUP_ADIF, "rb") as f:
-                data = f.read()
-        except OSError:
-            return keys
-        for raw in parse_adif(data):
-            rec, err = normalize_record(raw, True)
-            if rec:
-                keys.add(qso_key(rec))
+        for path in (BACKUP_ADIF, DELETED_ADIF):
+            for raw in read_adif_file(path):
+                rec, err = normalize_record(raw, True)
+                if rec:
+                    keys.add(qso_key(rec))
         return keys
 
     def stop(self):
@@ -1318,13 +1571,7 @@ class Engine:
             self.seen[key] = now
             self.stats["received"] += 1
             adif = build_adif(rec)
-            try:
-                with open(BACKUP_ADIF, "a", encoding="utf-8") as f:
-                    if f.tell() == 0:
-                        f.write("QSO ricevuti da %s\n<ADIF_VER:5>3.1.4<EOH>\n" % APP_NAME)
-                    f.write(adif + "\n")
-            except OSError as e:
-                self.emit(("log", "warn", "impossibile scrivere il backup ADIF: %s" % e))
+            self._backup(adif)
 
         desc = describe(rec)
         self.emit(("log", "rx", "[%s] QSO ricevuto da %s (%s): %s" % (program, sender, proto, desc)))
@@ -1333,6 +1580,139 @@ class Engine:
             self.emit(("log", "info", "        ADIF: %s" % adif))
             return
         self.uploader.add(adif, desc, program)
+
+    def _backup(self, adif):
+        try:
+            append_adif(BACKUP_ADIF, adif, "QSO ricevuti da %s" % APP_NAME)
+        except OSError as e:
+            self.emit(("log", "warn", "impossibile scrivere il backup ADIF: %s" % e))
+
+    def add_manual(self, rec, settings):
+        """QSO inserito a mano: come uno ricevuto, senza il controllo dei doppioni ravvicinati
+        (lo fa la finestra, chiedendo conferma). Restituisce l'errore o None."""
+        rec, err = normalize_record(dict(rec, station_callsign=settings["callsign"]), True)
+        if err:
+            return err
+        adif = build_adif(rec)
+        with self.lock:
+            self.seen[qso_key(rec)] = time.time()  # se arriva anche via UDP è un doppione
+            self.stats["received"] += 1
+            self._backup(adif)
+        desc = describe(rec)
+        self.emit(("log", "rx", "[%s] QSO inserito a mano: %s" % (MANUAL_SOURCE, desc)))
+        if settings["dry_run"]:
+            self.emit(("log", "ok", "[%s] TEST, non inviato a Club Log: %s" % (MANUAL_SOURCE, desc)))
+            self.emit(("log", "info", "        ADIF: %s" % adif))
+            return None
+        self.uploader.add(adif, desc, MANUAL_SOURCE)
+        if not self.listeners:
+            self.emit(("log", "warn", "[%s] il QSO verrà inviato a Club Log appena avvii l'ascolto: %s"
+                       % (MANUAL_SOURCE, desc)))
+        return None
+
+    def delete_qso(self, rec, settings):
+        """Cancella da Club Log un QSO di qso_ricevuti.adi, o lo toglie dalla coda se non è ancora
+        partito. Restituisce (esito, messaggio); esito: "coda", "cancellato", "test", "non trovato",
+        "errore". Va chiamata fuori dalla GUI: aspetta la risposta di Club Log."""
+        desc = describe(rec)
+        removed = self.uploader.remove(stored_key(rec))
+        if removed is None:
+            return "errore", "Il QSO %s è in invio proprio ora: riprova tra qualche secondo." % desc
+        if removed:
+            self._mark_deleted(rec)
+            msg = "QSO tolto dalla coda prima dell'invio: %s" % desc
+            self.emit(("log", "ok", "[%s] %s" % (MANUAL_SOURCE, msg)))
+            return "coda", msg
+        if settings["dry_run"]:
+            msg = "TEST, non cancellato da Club Log: %s" % desc
+            self.emit(("log", "ok", "[%s] %s" % (MANUAL_SOURCE, msg)))
+            return "test", msg
+        band_id = DELETE_BAND_IDS.get(rec.get("band", "").lower())
+        if not band_id:
+            return "errore", ("Club Log non permette di cancellare con le API i QSO in banda %s: "
+                              "cancella %s dal sito di Club Log (Log Inspector)." % (rec.get("band", "?"), desc))
+        when = delete_datetime(rec)
+        # Club Log vuole data e ora esatte; se ha registrato l'ora senza i secondi va bene anche :00
+        for attempt in [when] + ([when[:-2] + "00"] if not when.endswith(":00") else []):
+            try:
+                code, text = self.uploader.delete(rec.get("call", ""), attempt, band_id, settings)
+            except Exception as e:  # rete assente, timeout, SSL...
+                msg = "Cancellazione non riuscita, rete non disponibile (%s): %s" % (getattr(e, "reason", e), desc)
+                self.emit(("log", "err", "[%s] %s" % (MANUAL_SOURCE, msg)))
+                return "errore", msg
+            short = text.replace("\r", " ").replace("\n", " ")[:160]
+            if code != 200:
+                msg = "Club Log non ha cancellato %s (HTTP %d: %s)" % (desc, code, short)
+                self.emit(("log", "err", "[%s] %s" % (MANUAL_SOURCE, msg)))
+                return "errore", msg
+            if not re.search(r"not\s*deleted", text, re.IGNORECASE):
+                self._mark_deleted(rec)
+                msg = "Cancellato da Club Log: %s (%s UTC)  [%s]" % (desc, attempt, short)
+                self.emit(("log", "ok", "[%s] %s" % (MANUAL_SOURCE, msg)))
+                return "cancellato", msg
+        msg = "Club Log non ha trovato il QSO %s (%s UTC): nessuna cancellazione" % (desc, when)
+        self.emit(("log", "warn", "[%s] %s" % (MANUAL_SOURCE, msg)))
+        return "non trovato", msg
+
+    def download_clublog_log(self, settings):
+        """Scarica tutto il log da Club Log (getadif.php) in log_clublog.adi. Restituisce (esito, messaggio);
+        esito "ok" o "errore". Va chiamata fuori dalla GUI: aspetta la risposta di Club Log."""
+        try:
+            age = time.time() - os.path.getmtime(CLUBLOG_ADIF)
+        except OSError:
+            age = None
+        if age is not None and 0 <= age < DOWNLOAD_MIN_INTERVAL_S:
+            return "errore", ("Il log è stato scaricato %d secondi fa: per non caricare Club Log con richieste "
+                              "ravvicinate si può riscaricarlo tra %d secondi." % (age, DOWNLOAD_MIN_INTERVAL_S - age))
+        body = urllib.parse.urlencode({"email": settings.get("email", ""), "password": settings.get("password", ""),
+                                       "call": settings.get("callsign", "")}).encode("ascii")
+        try:
+            code, text = self.uploader._http(GETADIF_URL, body, "application/x-www-form-urlencoded", 180)
+        except Exception as e:  # rete assente, timeout, SSL...
+            return "errore", "Download non riuscito, rete non disponibile (%s)" % getattr(e, "reason", e)
+        short = text.replace("\r", " ").replace("\n", " ")[:160]
+        if code != 200:
+            msg = "Club Log non ha dato il log (HTTP %d: %s)" % (code, short)
+            self.emit(("log", "err", "[%s] %s" % (MANUAL_SOURCE, msg)))
+            return "errore", msg
+        if not re.search(r"<eoh>|<eor>", text, re.IGNORECASE):
+            return "errore", "Club Log non ha risposto con un log ADIF: %s" % short
+        count = len(parse_adif(text))
+        tmp = CLUBLOG_ADIF + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, CLUBLOG_ADIF)
+        except OSError as e:
+            return "errore", "Impossibile salvare %s: %s" % (os.path.basename(CLUBLOG_ADIF), e)
+        msg = "Scaricato da Club Log il log di %s: %d QSO" % (settings.get("callsign", ""), count)
+        self.emit(("log", "ok", "[%s] %s" % (MANUAL_SOURCE, msg)))
+        return "ok", msg
+
+    def add_to_program_logs(self, rec, targets):
+        """Aggiunge il QSO inserito a mano (già normalizzato) ai log scelti: [(etichetta, percorso)].
+        Restituisce le righe di esito per la finestra."""
+        lines = []
+        for label, path in targets:
+            try:
+                if path:
+                    append_to_wsjtx_log(path, rec)
+                    msg = "aggiunto a %s (si vede come già collegato dopo il riavvio del programma)" % path
+                else:
+                    msg = "file da importare in MSHV: %s" % write_mshv_import(rec)
+                level = "ok"
+            except (OSError, ValueError) as e:
+                msg, level = "NON aggiunto a %s: %s" % (path or "MSHV", e), "err"
+            self.emit(("log", level, "[%s] %s %s" % (MANUAL_SOURCE, label, msg)))
+            lines.append("%s: %s" % (label, msg))
+        return lines
+
+    def _mark_deleted(self, rec):
+        # Il QSO resta in qso_ricevuti.adi: così il recupero dai log dei programmi non lo rimanda
+        try:
+            append_adif(DELETED_ADIF, build_adif(rec), "QSO cancellati da Club Log con %s" % APP_NAME)
+        except OSError as e:
+            self.emit(("log", "warn", "impossibile scrivere %s: %s" % (os.path.basename(DELETED_ADIF), e)))
 
 
 # --------------------------------------------------------------------------
@@ -1668,6 +2048,10 @@ def run_gui():
     b_stop.pack(side="left", padx=6)
     b_retry = ttk.Button(bar, text="Riprova coda")
     b_retry.pack(side="left")
+    b_new = ttk.Button(bar, text="Nuovo QSO...")
+    b_new.pack(side="left", padx=(6, 0))
+    b_search = ttk.Button(bar, text="Cerca QSO...")
+    b_search.pack(side="left", padx=(6, 0))
     b_import = ttk.Button(bar, text="Importa log ADIF...")
     b_import.pack(side="left", padx=6)
     b_folder = ttk.Button(bar, text="Apri cartella dati")
@@ -1975,9 +2359,446 @@ def run_gui():
         refresh()
         win.grab_set()
 
+    # --- QSO inseriti a mano, ricerca e cancellazione ---
+    def club_settings(for_delete):
+        """Impostazioni attuali per un QSO inserito a mano o una cancellazione, con gli errori."""
+        c = collect()
+        errs = []
+        if not c["callsign"]:
+            errs.append("Inserisci il nominativo DX nella scheda Club Log.")
+        if for_delete and not c["dry_run"]:
+            for key, label in (("email", "l'email Club Log"), ("password", "l'app password"),
+                               ("api", "l'API key")):
+                if not c[key] and not (key == "api" and BUILTIN_API_KEY):
+                    errs.append("Inserisci %s nella scheda Club Log." % label)
+        if BUILTIN_API_KEY:
+            c["api"] = BUILTIN_API_KEY  # mai salvata nelle impostazioni
+        return c, errs
+
+    def run_async(win, buttons, work, done):
+        """Esegue work() in un thread (aspetta Club Log) e poi done(risultato) nella GUI."""
+        result = {}
+
+        def worker():
+            try:
+                result["v"] = work()
+            except Exception as e:  # il thread non deve mai morire in silenzio
+                result["v"] = ("errore", "Errore imprevisto: %s" % e)
+
+        for b in buttons:
+            b.configure(state="disabled")
+        win.configure(cursor="watch")
+        win.protocol("WM_DELETE_WINDOW", lambda: None)  # niente chiusura finché Club Log non risponde
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
+
+        def check():
+            if th.is_alive():
+                root.after(100, check)
+                return
+            win.configure(cursor="")
+            win.protocol("WM_DELETE_WINDOW", win.destroy)
+            for b in buttons:
+                b.configure(state="normal")
+            done(result["v"])
+
+        root.after(100, check)
+
+    def qso_dialog(parent, old=None, old_status=None, on_done=None):
+        """Finestra Nuovo QSO, o Correggi QSO se c'è il QSO vecchio (com'è in qso_ricevuti.adi)."""
+        c, errs = club_settings(old is not None and old_status in (QSO_STATUS_SENT, QSO_STATUS_QUEUED,
+                                                                    QSO_STATUS_CLUBLOG))
+        if errs:
+            messagebox.showerror(APP_NAME, "\n".join(errs), parent=parent)
+            return
+        win = tk.Toplevel(parent)
+        win.title("Correggi QSO" if old else "Nuovo QSO")
+        win.transient(parent)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=14)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Log Club Log di %s%s" % (c["callsign"], "  -  modalità TEST" if c["dry_run"] else ""),
+                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
+        row = 1
+        if old:
+            ttk.Label(frm, text="QSO da correggere: %s\n(su Club Log: %s UTC)" % (
+                describe(old), delete_datetime(old)), justify="left").grid(
+                row=row, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            row += 1
+
+        d = {k: tk.StringVar() for k in ("call", "date", "time", "band", "mode", "sent", "rcvd")}
+        if old:
+            od, ot = old.get("qso_date", ""), old.get("time_on", "").ljust(6, "0")
+            d["call"].set(old.get("call", ""))
+            d["date"].set("%s-%s-%s" % (od[0:4], od[4:6], od[6:8]))
+            d["time"].set("%s:%s:%s" % (ot[0:2], ot[2:4], ot[4:6]))
+            d["band"].set(old.get("band", "").lower())
+            d["mode"].set(old.get("submode") or old.get("mode", ""))
+            d["sent"].set(old.get("rst_sent", ""))
+            d["rcvd"].set(old.get("rst_rcvd", ""))
+
+        def field(label, widget, hint=None, extra=None):
+            nonlocal row
+            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="e", pady=(6, 0))
+            widget.grid(row=row, column=1, sticky="w", padx=4, pady=(6, 0))
+            if hint:
+                ttk.Label(frm, text=hint, foreground="#666666").grid(row=row, column=2, sticky="w", pady=(6, 0))
+            if extra:
+                extra.grid(row=row, column=2, sticky="w", pady=(6, 0))
+            row += 1
+            return widget
+
+        e_qcall = field("Nominativo:", ttk.Entry(frm, textvariable=d["call"], width=14))
+
+        def now_utc():
+            t = dt.datetime.now(dt.timezone.utc)
+            d["date"].set(t.strftime("%Y-%m-%d"))
+            d["time"].set(t.strftime("%H:%M:%S"))
+
+        field("Data (UTC):", ttk.Entry(frm, textvariable=d["date"], width=12),
+              extra=ttk.Button(frm, text="Adesso", command=now_utc))
+        field("Ora (UTC):", ttk.Entry(frm, textvariable=d["time"], width=12), "HH:MM o HH:MM:SS")
+        l_local = tk.Label(frm, anchor="w", fg=COLORS["info"])
+        l_local.grid(row=row, column=1, columnspan=2, sticky="w", padx=4)
+        row += 1
+        field("Banda:", ttk.Combobox(frm, textvariable=d["band"], values=[b for _, _, b in BANDS],
+                                     width=8, state="readonly"))
+        field("Modo:", ttk.Combobox(frm, textvariable=d["mode"], values=MANUAL_MODES, width=10))
+        field("RST trasmesso:", ttk.Entry(frm, textvariable=d["sent"], width=8))
+        field("RST ricevuto:", ttk.Entry(frm, textvariable=d["rcvd"], width=8))
+
+        def show_local(*_):
+            try:
+                t = parse_utc_input(d["date"].get(), d["time"].get())
+            except ValueError as e:
+                l_local.configure(text=str(e) if d["date"].get().strip() and d["time"].get().strip() else
+                                  "Data AAAA-MM-GG, ora UTC (non quella locale)", fg=COLORS["warn"])
+                return
+            local = t.replace(tzinfo=dt.timezone.utc).astimezone()
+            l_local.configure(text="= %s ora locale" % local.strftime("%d/%m/%Y %H:%M:%S"), fg=COLORS["info"])
+
+        last_default = {"rst": default_rst(d["mode"].get()) if d["mode"].get() else ""}
+
+        def mode_changed(*_):
+            # Rapporto proposto in base al modo, se non è già stato scritto a mano
+            new = default_rst(d["mode"].get().strip())
+            for k in ("sent", "rcvd"):
+                if d[k].get().strip() in ("", last_default["rst"]):
+                    d[k].set(new)
+            last_default["rst"] = new
+
+        d["date"].trace_add("write", show_local)
+        d["time"].trace_add("write", show_local)
+        d["mode"].trace_add("write", mode_changed)
+        show_local()
+
+        # Log dei programmi a cui aggiungere il QSO: mai in modalità TEST, sono i log veri
+        targets = program_log_targets()
+        t_vars = []
+        if targets:
+            ttk.Label(frm, text="Aggiungi anche a:").grid(row=row, column=0, sticky="ne", pady=(10, 0))
+            tf = ttk.Frame(frm)
+            tf.grid(row=row, column=1, columnspan=2, sticky="w", padx=4, pady=(10, 0))
+            for label, path in targets:
+                v = tk.BooleanVar(value=False)
+                ttk.Checkbutton(tf, text=label, variable=v, state="disabled" if c["dry_run"] else "normal").pack(
+                    anchor="w")
+                t_vars.append((v, label, path))
+            if c["dry_run"]:
+                ttk.Label(tf, text="(non in modalità TEST)", foreground="#666666").pack(anchor="w")
+            row += 1
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=row, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        b_ok = ttk.Button(btns, text="Correggi" if old else "Invia a Club Log")
+        b_ok.pack(side="left", padx=(0, 6))
+        b_cancel = ttk.Button(btns, text="Annulla", command=win.destroy)
+        b_cancel.pack(side="left")
+
+        def send(rec):
+            """Invia il QSO, lo aggiunge ai log scelti e chiude la finestra con il riepilogo."""
+            err = engine.add_manual(rec, c)
+            if err:
+                messagebox.showerror(APP_NAME, "QSO non valido: %s" % err, parent=win)
+                return
+            chosen = [(label, path) for v, label, path in t_vars if v.get()]
+            notes = []
+            if chosen:
+                notes += engine.add_to_program_logs(
+                    normalize_record(dict(rec, station_callsign=c["callsign"]), True)[0], chosen)
+                if any(not path for _, path in chosen):
+                    notes.append(MSHV_IMPORT_NOTE)
+            if old and any(not path for _, path in targets):
+                notes.append(MSHV_FIX_NOTE)
+            if old and any(path for _, path in targets):
+                notes.append("Se il QSO vecchio è nel log di WSJT-X o JTDX resta lì: questi programmi non hanno un "
+                             "comando per cancellarlo.")
+            win.destroy()
+            if on_done:
+                on_done()
+            if notes:
+                messagebox.showinfo(APP_NAME, "\n\n".join(notes), parent=parent)
+
+        def confirm():
+            errs = []
+            call = d["call"].get().strip().upper()
+            if not re.fullmatch(r"[A-Z0-9]+(/[A-Z0-9]+)*", call) or len(call) < 3 or \
+                    not re.search(r"\d", call) or not re.search(r"[A-Z]", call):
+                errs.append("Nominativo non valido.")
+            when = None
+            try:
+                when = parse_utc_input(d["date"].get(), d["time"].get())
+                if when > dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) + dt.timedelta(minutes=10):
+                    errs.append("Data e ora sono nel futuro: vanno scritte in UTC.")
+            except ValueError as e:
+                errs.append(str(e))
+            band = d["band"].get().strip().lower()
+            if not band:
+                errs.append("Scegli la banda.")
+            mode = d["mode"].get().strip().upper()
+            if not re.fullmatch(r"[A-Z0-9-]+", mode):
+                errs.append("Modo non valido.")
+            for k, label in (("sent", "trasmesso"), ("rcvd", "ricevuto")):
+                if len(d[k].get().strip()) > 10:
+                    errs.append("RST %s troppo lungo." % label)
+            if errs:
+                messagebox.showerror(APP_NAME, "\n".join(errs), parent=win)
+                return
+            rec = {"call": call, "qso_date": when.strftime("%Y%m%d"), "time_on": when.strftime("%H%M%S"),
+                   "band": band, "mode": mode, "rst_sent": d["sent"].get().strip(),
+                   "rst_rcvd": d["rcvd"].get().strip()}
+            new_desc = describe(normalize_record(dict(rec), True)[0])
+            entries = received_qsos(engine.uploader.queued_keys())
+            ts = when.replace(tzinfo=dt.timezone.utc).timestamp()
+            near = nearby_qsos(entries, call, band, ts, stored_key(old) if old else None)
+            if near and not messagebox.askyesno(
+                    APP_NAME, "Ci sono già QSO con %s in %s vicini a quest'ora:\n\n%s\n\nContinuare comunque?"
+                              % (call, band, "\n".join(describe(r) for r in near[:8])),
+                    icon="warning", parent=win):
+                return
+            test = "\n\nModalità TEST: niente viene inviato o cancellato su Club Log." if c["dry_run"] else ""
+            if not old:
+                if not messagebox.askyesno(APP_NAME, "Inviare a Club Log il QSO?\n\n%s%s" % (new_desc, test),
+                                           parent=win):
+                    return
+                send(rec)
+                return
+            on_club = old_status in (QSO_STATUS_SENT, QSO_STATUS_QUEUED, QSO_STATUS_CLUBLOG)
+            if not messagebox.askyesno(
+                    APP_NAME, "Correggere il QSO?\n\nPrima:  %s\nDopo:   %s\n\n%s%s" % (
+                        describe(old), new_desc,
+                        "Il QSO vecchio viene cancellato da Club Log (non si può annullare) e quello "
+                        "corretto viene inviato." if on_club else
+                        "Il QSO vecchio non è su Club Log (%s): viene solo inviato quello corretto." % old_status,
+                        test), icon="warning", parent=win):
+                return
+            if not on_club:
+                send(rec)
+                return
+
+            def deleted(result):
+                outcome, msg = result
+                if outcome == "non trovato":
+                    if not messagebox.askyesno(APP_NAME, "%s.\n\nInviare comunque il QSO corretto?" % msg,
+                                               icon="warning", parent=win):
+                        return
+                elif outcome == "errore":
+                    messagebox.showerror(APP_NAME, "%s\n\nIl QSO corretto non è stato inviato." % msg, parent=win)
+                    return
+                send(rec)
+
+            run_async(win, [b_ok, b_cancel], lambda: engine.delete_qso(old, c), deleted)
+
+        b_ok.configure(command=confirm)
+        win.bind("<Return>", lambda e: confirm())
+        win.bind("<Escape>", lambda e: win.destroy())
+        e_qcall.focus_set()
+        win.grab_set()
+
+    def do_new_qso():
+        qso_dialog(root)
+
+    def do_search():
+        win = tk.Toplevel(root)
+        win.title("Cerca QSO")
+        win.transient(root)
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+        flt = ttk.Frame(frm)
+        flt.pack(fill="x")
+        f_call, f_date, f_band = tk.StringVar(), tk.StringVar(), tk.StringVar(value="(tutte)")
+        ttk.Label(flt, text="Nominativo:").pack(side="left")
+        e_fcall = ttk.Entry(flt, textvariable=f_call, width=12)
+        e_fcall.pack(side="left", padx=(4, 12))
+        ttk.Label(flt, text="Data (UTC):").pack(side="left")
+        ttk.Entry(flt, textvariable=f_date, width=12).pack(side="left", padx=(4, 12))
+        ttk.Label(flt, text="Banda:").pack(side="left")
+        ttk.Combobox(flt, textvariable=f_band, values=["(tutte)"] + [b for _, _, b in BANDS], width=8,
+                     state="readonly").pack(side="left", padx=4)
+        l_count = ttk.Label(flt)
+        l_count.pack(side="left", padx=12)
+
+        cols = (("date", "Data", 86), ("time", "Ora UTC", 70), ("call", "Nominativo", 100), ("band", "Banda", 56),
+                ("mode", "Modo", 60), ("sent", "RST tx", 54), ("rcvd", "RST rx", 54), ("status", "Stato", 80))
+        lst = ttk.Frame(frm)
+        lst.pack(fill="both", expand=True, pady=8)
+        tree = ttk.Treeview(lst, columns=[k for k, _, _ in cols], show="headings", height=16, selectmode="browse")
+        for k, title, w in cols:
+            tree.heading(k, text=title)
+            tree.column(k, width=w, stretch=k == "status")
+        sb = ttk.Scrollbar(lst, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        tree.tag_configure(QSO_STATUS_DELETED, foreground="#888888")
+        tree.tag_configure(QSO_STATUS_REJECTED, foreground=COLORS["err"])
+        tree.tag_configure(QSO_STATUS_QUEUED, foreground=COLORS["rx"])
+
+        ttk.Label(frm, foreground="#666666", justify="left",
+                  text="Sono elencati i QSO passati dal listener (qso_ricevuti.adi), compresi quelli ricevuti in "
+                       "modalità TEST, con data e ora\ninviate a Club Log. Per vedere anche i QSO caricati in altro "
+                       "modo (dal sito, da altri PC) scarica il log da Club Log.").pack(anchor="w")
+        l_download = ttk.Label(frm, foreground="#666666")
+        l_download.pack(anchor="w")
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(8, 0))
+        b_snew = ttk.Button(btns, text="Nuovo QSO...")
+        b_snew.pack(side="left")
+        b_fix = ttk.Button(btns, text="Correggi...")
+        b_fix.pack(side="left", padx=6)
+        b_del = ttk.Button(btns, text="Cancella da Club Log")
+        b_del.pack(side="left")
+        b_get = ttk.Button(btns, text="Scarica log da Club Log")
+        b_get.pack(side="left", padx=6)
+        b_close = ttk.Button(btns, text="Chiudi", command=win.destroy)
+        b_close.pack(side="right")
+
+        data = {"entries": []}
+        MAX_ROWS = 2000
+
+        def load():
+            data["entries"] = received_qsos(engine.uploader.queued_keys())
+            try:
+                when = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(CLUBLOG_ADIF)))
+                l_download.configure(text="Log scaricato da Club Log il %s (%d QSO non passati dal listener)." % (
+                    when, sum(1 for _, st in data["entries"] if st == QSO_STATUS_CLUBLOG)))
+            except OSError:
+                l_download.configure(text="Log di Club Log non ancora scaricato.")
+            refresh()
+
+        def do_download():
+            c, errs = club_settings(False)
+            # Anche in modalità TEST: il download non cambia niente su Club Log
+            for key, label in (("email", "l'email Club Log"), ("password", "l'app password")):
+                if not c[key]:
+                    errs.append("Inserisci %s nella scheda Club Log." % label)
+            if errs:
+                messagebox.showerror(APP_NAME, "\n".join(errs), parent=win)
+                return
+            if not messagebox.askyesno(APP_NAME, "Scaricare da Club Log tutto il log di %s?\n\nServe solo per cercare "
+                                       "i QSO non passati dal listener. Con un log grande può volerci un po'; "
+                                       "non ripeterlo spesso." % c["callsign"], parent=win):
+                return
+
+            def done(result):
+                outcome, msg = result
+                if outcome == "errore":
+                    messagebox.showerror(APP_NAME, msg, parent=win)
+                load()
+
+            run_async(win, [b_snew, b_fix, b_del, b_get, b_close], lambda: engine.download_clublog_log(c), done)
+
+        def refresh(*_):
+            tree.delete(*tree.get_children())
+            call = f_call.get().strip().upper()
+            day = re.sub(r"\D", "", f_date.get())
+            band = "" if f_band.get() == "(tutte)" else f_band.get()
+            found = 0
+            entries = data["entries"]
+            order = sorted(range(len(entries)), reverse=True,  # dal più recente
+                           key=lambda j: (entries[j][0].get("qso_date", "") + entries[j][0].get("time_on", ""), j))
+            for i in order:
+                rec, st = entries[i]
+                if (call and call not in rec.get("call", "").upper()) or \
+                        (day and not rec.get("qso_date", "").startswith(day)) or \
+                        (band and rec.get("band", "").lower() != band):
+                    continue
+                found += 1
+                if found > MAX_ROWS:
+                    continue
+                dd, tt = rec.get("qso_date", ""), rec.get("time_on", "").ljust(6, "0")
+                tree.insert("", "end", iid=str(i), tags=(st,), values=(
+                    "%s-%s-%s" % (dd[0:4], dd[4:6], dd[6:8]), "%s:%s:%s" % (tt[0:2], tt[2:4], tt[4:6]),
+                    rec.get("call", ""), rec.get("band", "").lower(), rec.get("submode") or rec.get("mode", ""),
+                    rec.get("rst_sent", ""), rec.get("rst_rcvd", ""), st))
+            l_count.configure(text="%d QSO%s" % (found, " (mostrati i %d più recenti)" % MAX_ROWS
+                                                 if found > MAX_ROWS else ""))
+
+        def selected():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo(APP_NAME, "Seleziona un QSO nell'elenco.", parent=win)
+                return None
+            return data["entries"][int(sel[0])]
+
+        def do_fix(event=None):
+            entry = selected()
+            if entry:
+                qso_dialog(win, entry[0], entry[1], load)
+
+        def do_delete():
+            entry = selected()
+            if not entry:
+                return
+            rec, st = entry
+            if st == QSO_STATUS_DELETED:
+                messagebox.showinfo(APP_NAME, "Il QSO %s è già stato cancellato." % describe(rec), parent=win)
+                return
+            if st == QSO_STATUS_REJECTED:
+                messagebox.showinfo(APP_NAME, "Il QSO %s era stato rifiutato da Club Log: non è nel log."
+                                    % describe(rec), parent=win)
+                return
+            c, errs = club_settings(True)
+            if errs:
+                messagebox.showerror(APP_NAME, "\n".join(errs), parent=win)
+                return
+            what = ("Il QSO è ancora in coda: viene solo tolto dalla coda." if st == QSO_STATUS_QUEUED else
+                    "La cancellazione da Club Log non si può annullare.")
+            if c["dry_run"]:
+                what += "\n\nModalità TEST: niente viene cancellato su Club Log."
+            if not messagebox.askyesno(APP_NAME, "Cancellare dal log Club Log di %s il QSO?\n\n%s\n(%s UTC)\n\n%s"
+                                       % (c["callsign"], describe(rec), delete_datetime(rec), what),
+                                       icon="warning", parent=win):
+                return
+
+            def done(result):
+                outcome, msg = result
+                if outcome == "errore":
+                    messagebox.showerror(APP_NAME, msg, parent=win)
+                elif outcome == "non trovato":
+                    messagebox.showwarning(APP_NAME, msg, parent=win)
+                else:
+                    messagebox.showinfo(APP_NAME, msg, parent=win)
+                load()
+
+            run_async(win, [b_snew, b_fix, b_del, b_get, b_close], lambda: engine.delete_qso(rec, c), done)
+
+        b_snew.configure(command=lambda: qso_dialog(win, on_done=load))
+        b_fix.configure(command=do_fix)
+        b_del.configure(command=do_delete)
+        b_get.configure(command=do_download)
+        tree.bind("<Double-1>", do_fix)
+        win.bind("<Escape>", lambda e: win.destroy())
+        for v in (f_call, f_date, f_band):
+            v.trace_add("write", refresh)
+        load()
+        e_fcall.focus_set()
+
     b_start.configure(command=do_start)
     b_stop.configure(command=do_stop)
     b_retry.configure(command=do_retry)
+    b_new.configure(command=do_new_qso)
+    b_search.configure(command=do_search)
     b_import.configure(command=do_import)
     b_folder.configure(command=do_folder)
 

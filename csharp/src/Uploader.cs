@@ -46,6 +46,7 @@ namespace ClubLogListener
         double lastBatch;
         bool batchWaitLogged;
         readonly QueueItem jobState = new QueueItem();  // tentativi falliti per i log importati
+        List<QueueItem> inFlight = new List<QueueItem>();  // in invio in questo momento: non si tolgono dalla coda
 
         static Uploader()
         {
@@ -181,6 +182,67 @@ namespace ClubLogListener
             Wake.Set();
         }
 
+        public List<string> QueuedKeys()
+        {
+            List<QueueItem> copy;
+            lock (sync)
+                copy = items.ToList();
+            var keys = new List<string>();
+            foreach (var it in copy)
+            {
+                var recs = Adif.Parse(it.Adif);
+                if (recs.Count > 0)
+                    keys.Add(Manuale.StoredKey(recs[0]));
+            }
+            return keys;
+        }
+
+        // Toglie dalla coda il QSO con questa chiave: 1 tolto, 0 non in coda, -1 in invio proprio ora
+        public int Remove(string key)
+        {
+            lock (sync)
+            {
+                foreach (var it in items)
+                {
+                    var recs = Adif.Parse(it.Adif);
+                    if (recs.Count == 0 || Manuale.StoredKey(recs[0]) != key)
+                        continue;
+                    if (inFlight.Contains(it))
+                        return -1;
+                    items.Remove(it);
+                    Save();
+                    return 1;
+                }
+            }
+            return 0;
+        }
+
+        // Cancella un QSO con delete.php
+        public static int Delete(string dxcall, string when, string bandId, Settings s, out string text)
+        {
+            var fields = new[] {
+                new KeyValuePair<string, string>("email", s.Email),
+                new KeyValuePair<string, string>("password", s.Password),
+                new KeyValuePair<string, string>("callsign", s.Callsign),
+                new KeyValuePair<string, string>("dxcall", dxcall),
+                new KeyValuePair<string, string>("datetime", when),
+                new KeyValuePair<string, string>("bandid", bandId),
+                new KeyValuePair<string, string>("api", s.Api) };
+            string body = string.Join("&", fields.Select(kv => FormEncode(kv.Key) + "=" + FormEncode(kv.Value)));
+            return Http(App.DeleteUrl, Encoding.ASCII.GetBytes(body), "application/x-www-form-urlencoded", 20, out text);
+        }
+
+        // Tutto il log da Club Log con getadif.php (ADIF)
+        public static int GetAdif(Settings s, out string text)
+        {
+            var fields = new[] {
+                new KeyValuePair<string, string>("email", s.Email),
+                new KeyValuePair<string, string>("password", s.Password),
+                new KeyValuePair<string, string>("call", s.Callsign) };
+            string body = string.Join("&", fields.Select(kv => FormEncode(kv.Key) + "=" + FormEncode(kv.Value)));
+            return Http(App.GetAdifUrl, Encoding.ASCII.GetBytes(body), "application/x-www-form-urlencoded", 180, out text);
+        }
+
         public void Resume()
         {
             Paused = false;
@@ -196,12 +258,13 @@ namespace ClubLogListener
 
         public bool Join(int ms) { return thread.Join(ms); }
 
-        void DropFirst()
+        // Per identità e non per posizione: nel frattempo un QSO può essere stato tolto dalla coda a mano
+        void Drop(IEnumerable<QueueItem> sent)
         {
             lock (sync)
             {
-                if (items.Count > 0)
-                    items.RemoveAt(0);
+                foreach (var it in sent)
+                    items.Remove(it);
                 Save();
             }
         }
@@ -337,6 +400,11 @@ namespace ClubLogListener
                     Log("err", "errore interno nell'invio: " + e.Message);
                     Wake.WaitOne(1000);
                 }
+                finally
+                {
+                    lock (sync)
+                        inFlight = new List<QueueItem>();
+                }
             }
         }
 
@@ -443,7 +511,10 @@ namespace ClubLogListener
         {
             List<QueueItem> batch;
             lock (sync)
+            {
                 batch = items.Take(App.BatchMaxQso).ToList();
+                inFlight = batch;
+            }
             string adifFile = string.Format("Coda di {0}\n<ADIF_VER:5>3.1.4<PROGRAMID:{1}>{0}<EOH>\n{2}\n",
                 App.Name, App.Name.Length, string.Join("\n", batch.Select(i => i.Adif)));
             Log("info", string.Format("Invio a blocchi di {0} QSO in coda (putlogs.php)...", batch.Count));
@@ -463,11 +534,7 @@ namespace ClubLogListener
             string shortText = Short(text);
             if (code == 200)
             {
-                lock (sync)
-                {
-                    items.RemoveRange(0, Math.Min(batch.Count, items.Count));
-                    Save();
-                }
+                Drop(batch);
                 Interlocked.Add(ref stats.Sent, batch.Count);
                 Log("ok", string.Format("Club Log ha accettato il blocco di {0} QSO: li elabora entro circa un minuto [{1}]",
                     batch.Count, shortText));
@@ -479,6 +546,12 @@ namespace ClubLogListener
 
         void SendOne(QueueItem item)
         {
+            lock (sync)
+            {
+                if (!items.Contains(item))
+                    return;  // tolto dalla coda a mano subito prima dell'invio
+                inFlight = new List<QueueItem> { item };
+            }
             int code;
             string text;
             try
@@ -500,7 +573,7 @@ namespace ClubLogListener
                     Log("warn", string.Format("Club Log ha accettato ma modificato {0}: {1}", item.Desc, shortText));
                 else
                     Log("ok", string.Format("Club Log OK: {0}  [{1}]", item.Desc, shortText));
-                DropFirst();
+                Drop(new[] { item });
                 NextTry = Util.Now() + interval;
             }
             else if (code == 403 || text.StartsWith("Login rejected", StringComparison.Ordinal))
@@ -517,7 +590,7 @@ namespace ClubLogListener
                 catch (Exception)
                 {
                 }
-                DropFirst();
+                Drop(new[] { item });
                 NextTry = Util.Now() + interval;
             }
             else if (App.RetryableHttp.Contains(code))  // 500 (manutenzione) e simili: riprovare più tardi

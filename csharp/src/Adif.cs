@@ -67,6 +67,11 @@ namespace ClubLogListener
         static readonly Encoding StrictUtf8 = new UTF8Encoding(false, true);
         public static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
+        public static IEnumerable<string> BandNames
+        {
+            get { return Bands.Select(b => b.Name); }
+        }
+
         public static string FreqToBand(double mhz)
         {
             foreach (Band b in Bands)

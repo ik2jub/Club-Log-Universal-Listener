@@ -65,7 +65,7 @@ namespace ClubLogListener
         internal CheckBox cShow, cFreq, cDry, cAuto, cTray, cBoot;
         internal NumericUpDown eInterval, eBatch;
         internal readonly List<ListenerRow> rows = new List<ListenerRow>();
-        internal Button bStart, bStop, bRetry, bImport, bFolder;
+        internal Button bStart, bStop, bRetry, bNew, bSearch, bImport, bFolder;
         ToolStripStatusLabel lMode, lCounters;
         internal RichTextBox txt;
         TableLayoutPanel mainPanel;
@@ -137,6 +137,12 @@ namespace ClubLogListener
             bStart.Click += (s, e) => DoStart();
             bStop.Click += (s, e) => DoStop();
             bRetry.Click += (s, e) => DoRetry();
+            bNew.Click += (s, e) => OpenQsoForm(this, null, null);
+            bSearch.Click += (s, e) =>
+            {
+                using (var f = new SearchForm(this))
+                    f.ShowDialog(this);
+            };
             bImport.Click += (s, e) => DoImport();
             bFolder.Click += (s, e) => DoFolder();
 
@@ -487,9 +493,11 @@ namespace ClubLogListener
             bStop = Btn("■ Ferma");
             bStop.Enabled = false;
             bRetry = Btn("Riprova coda");
+            bNew = Btn("Nuovo QSO...");
+            bSearch = Btn("Cerca QSO...");
             bImport = Btn("Importa log ADIF...");
             bFolder = Btn("Apri cartella dati");
-            bar.Controls.AddRange(new Control[] { bStart, bStop, bRetry, bImport, bFolder });
+            bar.Controls.AddRange(new Control[] { bStart, bStop, bRetry, bNew, bSearch, bImport, bFolder });
             return bar;
         }
 
@@ -780,6 +788,43 @@ namespace ClubLogListener
             {
                 AddLog("err", "Impossibile aprire la cartella: " + e.Message);
             }
+        }
+
+        // Impostazioni attuali per un QSO inserito a mano o una cancellazione, con gli errori
+        internal Settings ClubSettings(bool forDelete, out List<string> errs)
+        {
+            Settings c = Collect().Copy();
+            errs = new List<string>();
+            if (c.Callsign.Length == 0)
+                errs.Add("Inserisci il nominativo DX nella scheda Club Log.");
+            if (forDelete && !c.DryRun)
+            {
+                if (c.Email.Length == 0)
+                    errs.Add("Inserisci l'email Club Log nella scheda Club Log.");
+                if (c.Password.Length == 0)
+                    errs.Add("Inserisci l'app password nella scheda Club Log.");
+                if (c.Api.Length == 0 && BuiltinKey.ApiKey.Length == 0)
+                    errs.Add("Inserisci l'API key nella scheda Club Log.");
+            }
+            if (BuiltinKey.ApiKey.Length > 0)
+                c.Api = BuiltinKey.ApiKey;  // mai salvata nelle impostazioni
+            return c;
+        }
+
+        // Finestra Nuovo QSO, o Correggi QSO se c'è il QSO vecchio (com'è in qso_ricevuti.adi)
+        internal void OpenQsoForm(IWin32Window parent, ReceivedQso old, Action onDone)
+        {
+            bool onClub = old != null && (old.Status == Manuale.StatusSent || old.Status == Manuale.StatusQueued ||
+                                          old.Status == Manuale.StatusClubLog);
+            List<string> errs;
+            Settings c = ClubSettings(onClub, out errs);
+            if (errs.Count > 0)
+            {
+                MessageBox.Show(parent, string.Join("\n", errs), App.Name, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            using (var f = new QsoForm(this, c, old, onDone))
+                f.ShowDialog(parent);
         }
 
         void DoImport()

@@ -27,8 +27,13 @@ namespace ClubLogListener
         public const string Version = "1.0";
         public static string RealtimeUrl = "https://clublog.org/realtime.php";
         public static string PutlogsUrl = "https://clublog.org/putlogs.php";
+        public static string DeleteUrl = "https://clublog.org/delete.php";
+        public static string GetAdifUrl = "https://clublog.org/getadif.php";
 
-        public static string BaseDir, ConfigFile, QueueFile, BackupAdif, RejectedAdif, JobsDir, JobsDoneDir, StateFile;
+        public static string BaseDir, ConfigFile, QueueFile, BackupAdif, RejectedAdif, DeletedAdif, JobsDir, JobsDoneDir, StateFile;
+        // Log intero scaricato da Club Log; copie di wsjtx_log.adi; file ADIF da importare in MSHV
+        public static string ClubLogAdif, ProgramLogCopiesDir, MshvImportDir;
+        public const int DownloadMinIntervalS = 300;  // tra due download del log intero: niente richieste ravvicinate
 
         public const int DedupWindowS = 30 * 60;
         public const int HoldQsoLoggedS = 3;  // attesa del Logged ADIF dopo un QSO Logged di WSJT-X/JTDX
@@ -56,6 +61,10 @@ namespace ClubLogListener
             QueueFile = Path.Combine(BaseDir, "clublog_listener_coda.json");
             BackupAdif = Path.Combine(BaseDir, "qso_ricevuti.adi");
             RejectedAdif = Path.Combine(BaseDir, "qso_rifiutati.adi");
+            DeletedAdif = Path.Combine(BaseDir, "qso_cancellati.adi");
+            ClubLogAdif = Path.Combine(BaseDir, "log_clublog.adi");
+            ProgramLogCopiesDir = Path.Combine(BaseDir, "copie_log_programmi");
+            MshvImportDir = Path.Combine(BaseDir, "da_importare_in_MSHV");
             // File ADIF importati: restano qui finché Club Log non li accetta, poi vengono spostati
             JobsDir = Path.Combine(BaseDir, "caricamenti_in_attesa");
             JobsDoneDir = Path.Combine(BaseDir, "caricamenti_inviati");

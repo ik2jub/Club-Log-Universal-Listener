@@ -10,6 +10,9 @@ clublog_listener_stato.json.tmp
 *.adif
 caricamenti_in_attesa/
 caricamenti_inviati/
+log_clublog.adi.tmp
+copie_log_programmi/
+da_importare_in_MSHV/
 
 # Python
 __pycache__/

@@ -23,6 +23,9 @@ namespace ClubLogListener
             {"12", "ISCAT-A"}, {"13", "ISCAT-B"}, {"14", "JT6M"}, {"15", "FSK315"}, {"17", "MSK144"},
             {"18", "JT65A"}, {"19", "JT65B"}, {"20", "JT65C"}, {"21", "PI4"}, {"22", "FT8"}, {"23", "MSKMS"},
             {"24", "FT4"}, {"25", "Q65A"}, {"26", "Q65B"}, {"27", "Q65C"}, {"28", "Q65D"}, {"29", "FT2"} };
+        // Modi che "Add ADIF To Log" di MSHV accetta: i suoi modi, più JT65, Q65 e ISCAT che converte da sé
+        public static readonly HashSet<string> MshvImportModes = new HashSet<string>(
+            MshvModes.Values.Where(m => m != "NON").Concat(new[] { "JT65", "Q65", "ISCAT" }));
         static readonly Regex MshvBand = new Regex(@"^([\d.]+)\s*([kMG])", RegexOptions.IgnoreCase);
 
         // Cartelle di installazione di MSHV, dalle voci di disinstallazione di Windows
